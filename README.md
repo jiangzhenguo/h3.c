@@ -1,6 +1,7 @@
 # h3-metal
 
-> 中文版：[README.zh-CN.md](README.zh-CN.md)
+> 中文版：[README.zh-CN.md](README.zh-CN.md) · Fork-local work:
+> [Optimizations in this fork](#optimizations-in-this-fork-local-work)
 
 Native MiniMax-H3 inference for Apple Silicon. The project is being built as a
 sequence of working vertical slices: deterministic host/model metadata first,
@@ -812,9 +813,91 @@ The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
 trees. Model phases are loaded and released separately so the 33B transformer,
 Qwen encoder, and decoders never have to coexist in unified memory.
 
-## Local notes (fork)
+## Optimizations in this fork (local work)
 
-This fork tracks a local, same-machine comparison against VPIPE and the video
-VAE BF16 rewrite that came out of it. The full reports, reproduction scripts,
-raw logs, patches and rendered media are archived in
+This fork adds two local optimizations to the video VAE decoder, together with
+the measurement work that motivated them. The full archive -- reports,
+reproduction scripts, raw logs, the patch and the rendered media -- lives in
 [`docs/vpipe/`](docs/vpipe/).
+
+### 1. BF16 video VAE decoder: 3.37x faster decode
+
+The MiniMax-H3 video VAE decoder is a 36-layer / 2048-wide ViT that ran
+entirely in FP32. MPS compiles FP32 matmul to a plain FP32 SIMD path, so the
+Apple tensor cores stayed idle: a micro-benchmark at the decoder's real shapes
+measured 6.2 TFLOP/s, which is the M5 Pro's FP32 SIMD peak (20 cores x 128 FLOP
+x 2 x 1.26 GHz). Moving the same GEMMs to BF16 puts them on the tensor cores
+at 26 TFLOP/s, roughly 4x.
+
+Measured in one session, 960x544, 124 frames, 6 denoising steps, seed 42, on an
+M5 Pro 64 GB, with precision as the only variable:
+
+| Metric | FP32 (before) | BF16 (after) | Change |
+|---|---:|---:|---:|
+| Video VAE decode | 159.450 s | 47.334 s | 3.37x |
+| End-to-end run | 409.95 s | 316.93 s | 1.29x |
+| Video VAE peak tensor storage | 9.365 GiB | 4.683 GiB | 0.50x |
+| GEMM throughput at the decoder shapes | 6.2 TFLOP/s | 26 TFLOP/s | ~4x |
+| Relative L2 against the FP32 decoder | - | 0.0048 | VPIPE's own bound is 0.02 |
+
+Re-run against VPIPE in the same session, to remove cross-day thermal drift,
+the video VAE went from 3.54x slower to 1.05x slower, and the end-to-end run
+went from 1.10x slower to 1.17x faster.
+
+Implementation:
+
+- All eleven decoder operators now run in BF16. The BF16 primitives already
+  existed in `h3_gpu.h` (`h3_gpu_linear_bf16`, `h3_gpu_sdpa_bf16`,
+  `h3_gpu_swiglu_bf16`, `h3_gpu_rms_norm_bf16`, `h3_gpu_layer_norm_bf16`); the
+  video VAE simply did not use them.
+- Two new Metal primitives close the last gaps: `h3_gpu_scale_add_bf16` and
+  `h3_gpu_video_qkv_rope_bf16`, line-for-line mirrors of their FP32
+  counterparts, including the RoPE half-split sign handling and the QK RMS
+  epsilon placement. Both are registered in the pipeline warm-up list.
+- The checkpoint stores all 560 decoder tensors as FP32, so
+  `h3_weight_load_f32_as_bf16()` converts them on the host with
+  round-to-nearest-even before upload. That costs 0.18 s for the full 9.7 GiB
+  set against 112 s saved, and resident weights drop from 9.16 GiB to 4.58 GiB.
+- The MLP keeps its bias, so it stays split into linear -> swiglu -> linear
+  rather than using the fused fc1+SwiGLU NAX kernel, which does not accept a
+  bias.
+- `H3_VAE_PRECISION=f32` restores the original FP32 path for A/B runs and
+  regression testing.
+
+### 2. Spatial tile pinned to the checkpoint's 256 pixels
+
+The released checkpoint trains the decoder on 256-pixel spatial tiles
+(`vae_tile_size` in `FL2VA/video_vae/config.json`), and the RoPE table is
+derived from the tile's own latent size, so a different tile size decodes a
+slightly different function than the one the model was trained on. The
+auto-tuned default picked 304 pixels for 960x544, which is 19x19 latent cells
+against the checkpoint's 16x16. The default is now pinned to 256;
+`H3_VAE_TILE_PIXELS` still overrides it.
+
+| | 304 px (old default) | 256 px (checkpoint) |
+|---|---:|---:|
+| Tiles for 960x544 | 8 | 15 |
+| Decoder time, FP32 | 126.09 s | 159.45 s |
+| Decoder time, BF16 | 35.4 s | 58.1 s |
+| Decoded frames, 304 against 256 | 41.62 dB PSNR, 0.9856 SSIM | |
+
+This is a fidelity-over-speed trade rather than a quality fix: the frames are
+not perceptibly different, and 304 pixels decodes about 26% less in FP32 and
+about 64% less in BF16, where the fixed per-tile dispatch cost stops being
+negligible next to the smaller matrix multiplies.
+
+### Tests
+
+Two test binaries were added and wired into `make test`:
+
+- `tests/test_video_vae.c` (`h3_video_vae_tests`) compares F32 and BF16
+  decodes: wall time, relative L2, max and mean absolute error, RGB range,
+  frame count and resolution, across several tile sizes, plus a load benchmark.
+- `tests/test_gpu_bf16_ops.c` (`h3_gpu_bf16_ops_tests`) validates the two new
+  primitives against their FP32 counterparts, including bit-exactness for
+  identical inputs.
+
+A numerical-neutrality run also compared the new binary, forced back to
+`H3_VAE_PRECISION=f32` with 304 px tiles, against the old binary: 23.12 dB
+PSNR / 0.832 SSIM, i.e. the thermal-drift noise level, with an identical
+operator profile (`submissions=56 direct=12264 linear=8120 attention=2016`).

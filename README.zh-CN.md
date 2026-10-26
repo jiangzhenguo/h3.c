@@ -1,6 +1,7 @@
 # h3-metal
 
-> 英文版：[README.md](README.md)
+> 英文版：[README.md](README.md) · 本 fork 的本地改动：
+> [本 fork 的优化](#本-fork-的优化)
 
 面向 Apple Silicon 的原生 MiniMax-H3 推理实现。这个项目以一连串可运行的纵向切片
 方式推进：先是确定性的 host/model 元数据，然后是可移植的 Metal block 对齐、
@@ -685,8 +686,77 @@ FC1 也使用 H3 专化的、编译期 5,376 宽的 TensorOps 循环。它与通
 分别加载和释放，因此 33B 的 transformer、Qwen 编码器和各解码器从不需要同时
 存在于统一内存中。
 
-## 本地扩展（fork）
+## 本 fork 的优化
 
-本 fork 记录了与 VPIPE 的本机同条件实测对比，以及由此产生的视频 VAE BF16
-改造。完整报告、复现脚本、原始日志、补丁与成片归档在
-[`docs/vpipe/`](docs/vpipe/)。
+本 fork 为视频 VAE 解码器加了两项本地优化，以及支撑它们的实测工作。完整归档
+——报告、复现脚本、原始日志、补丁与成片——都在 [`docs/vpipe/`](docs/vpipe/)。
+
+### 1. 视频 VAE 走 BF16：解码快 3.37 倍
+
+MiniMax-H3 的视频 VAE 解码器是 36 层 / 2048 宽的 ViT，此前全程跑 FP32。MPS 会把
+FP32 matmul 编译成普通的 FP32 SIMD 路径，于是 Apple 张量核心一直闲置：在解码器的
+真实形状上做微基准，测得 6.2 TFLOP/s，正好是 M5 Pro 的 FP32 SIMD 峰值
+（20 核 x 128 FLOP x 2 x 1.26 GHz）。把同样的 GEMM 换成 BF16 后就跑在张量核心上，
+达到 26 TFLOP/s，大约 4 倍。
+
+同一会话内实测，960x544、124 帧、6 步去噪、seed 42，M5 Pro 64 GB，唯一变量是精度：
+
+| 指标 | FP32（改造前） | BF16（改造后） | 变化 |
+|---|---:|---:|---:|
+| 视频 VAE 解码 | 159.450 s | 47.334 s | 3.37 倍 |
+| 端到端整轮 | 409.95 s | 316.93 s | 1.29 倍 |
+| 视频 VAE 张量存储峰值 | 9.365 GiB | 4.683 GiB | 0.50 倍 |
+| 解码器形状上的 GEMM 吞吐 | 6.2 TFLOP/s | 26 TFLOP/s | 约 4 倍 |
+| 相对 FP32 解码器的相对 L2 | - | 0.0048 | VPIPE 自身的门槛是 0.02 |
+
+同会话重跑 VPIPE（消除跨天热态差异）后，视频 VAE 从落后 3.54 倍变成落后 1.05 倍，
+端到端从落后 1.10 倍变成领先 1.17 倍。
+
+实现要点：
+
+- 解码器的 11 个算子全部改走 BF16。BF16 原语在 `h3_gpu.h` 里本来就有
+  （`h3_gpu_linear_bf16`、`h3_gpu_sdpa_bf16`、`h3_gpu_swiglu_bf16`、
+  `h3_gpu_rms_norm_bf16`、`h3_gpu_layer_norm_bf16`），只是视频 VAE 一个都没接。
+- 新增两个 Metal 原语补上最后的缺口：`h3_gpu_scale_add_bf16` 和
+  `h3_gpu_video_qkv_rope_bf16`。它们是对应 FP32 核的逐行忠实镜像，包括 RoPE
+  半轴切分的负半轴符号处理和 QK 的 RMS epsilon 位置。两个 kernel 名都已加入
+  pipeline 预热列表。
+- checkpoint 里 560 个解码器张量全是 FP32，因此新增 `h3_weight_load_f32_as_bf16()`，
+  在宿主端用 round-to-nearest-even 转成 BF16 再上传。全量 9.7 GiB 转换耗时
+  0.18 s，相对省下的 112 s 可以忽略；常驻权重从 9.16 GiB 降到 4.58 GiB。
+- MLP 保留 bias，所以仍拆成 linear -> swiglu -> linear，而没有用融合的
+  fc1+SwiGLU NAX kernel——后者不接受 bias。
+- `H3_VAE_PRECISION=f32` 可以恢复原来的 FP32 路径，用于 A/B 对照和回归测试。
+
+### 2. 空间 tile 固定回 checkpoint 的 256 像素
+
+发布版本的 checkpoint 是在 256 像素的空间 tile 上训练解码器的
+（`FL2VA/video_vae/config.json` 里的 `vae_tile_size`），而 RoPE 表由 tile 自身的
+latent 尺寸推导，所以换一个 tile 尺寸解码出来的就是另一个函数。原来的自动调优
+默认值在 960x544 上会挑 304 像素，也就是 19x19 的 latent 格，而 checkpoint 是
+16x16。现在默认值固定为 256，`H3_VAE_TILE_PIXELS` 仍可覆盖。
+
+| | 304 px（原默认值） | 256 px（checkpoint） |
+|---|---:|---:|
+| 960x544 的 tile 数 | 8 | 15 |
+| 解码耗时，FP32 | 126.09 s | 159.45 s |
+| 解码耗时，BF16 | 35.4 s | 58.1 s |
+| 成片对比（304 对 256） | 41.62 dB PSNR，0.9856 SSIM | |
+
+这是"用速度换规格一致"而不是抢救画质：两种尺寸的成片感知上无法区分，而 304 像素
+在 FP32 下少解约 26%，在 BF16 下少解约 64%——此时固定的每 tile dispatch 开销相对
+更小的矩阵乘已经不再可以忽略。
+
+### 测试
+
+新增两个测试二进制，并挂进 `make test`：
+
+- `tests/test_video_vae.c`（`h3_video_vae_tests`）对比 F32 与 BF16 解码：墙钟
+  时间、相对 L2、最大与平均绝对误差、RGB 值域、帧数与分辨率，覆盖多种 tile 尺寸，
+  并附带加载基准。
+- `tests/test_gpu_bf16_ops.c`（`h3_gpu_bf16_ops_tests`）验证两个新原语与对应
+  FP32 路径的一致性，相同输入下要求逐位一致。
+
+数值中性验证还把新二进制强制回 `H3_VAE_PRECISION=f32` + 304 px tile 与旧二进制
+对比：23.12 dB PSNR / 0.832 SSIM，即热漂移噪声量级，算子 profile 完全一致
+（`submissions=56 direct=12264 linear=8120 attention=2016`）。
