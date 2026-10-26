@@ -1,0 +1,118 @@
+[    0.00] [NORMAL] libavutil: using '/opt/homebrew/lib/libavutil.dylib'
+[    0.00] [NORMAL] libavcodec: using '/opt/homebrew/lib/libavcodec.dylib'
+[    0.02] [NORMAL] libswresample: using '/opt/homebrew/lib/libswresample.dylib'
+[    0.02] [NORMAL] libswscale: using '/opt/homebrew/lib/libswscale.dylib'
+[    0.02] [NORMAL] libavformat: using '/opt/homebrew/lib/libavformat.dylib'
+[    0.02] [NORMAL] libavdevice: using '/opt/homebrew/lib/libavdevice.dylib'
+[    0.02] [NORMAL] libavfilter: using '/opt/homebrew/lib/libavfilter.dylib'
+[    0.03] [INFO] PipelineRuntime: pipeline 'h3-t2v-compare' has 3 clock domains; domain 0 = {audio-vae-decode, minimax-h3-model-config, diffusion-conditioner, text-prompt, model-select}; domain 1 = {}; domain 2 = {rgb-to-video}; crossers = {save-video, vae-decode, generate-video}
+[    0.05] [INFO] memory landscape at launch: 65536 MB RAM -- 12270 MB idle, 28485 MB file cache, 6569 MB wired system-wide, 4360 MB compressed, 7265 MB swap; this process holds 7 MB
+[    0.05] [INFO] memory landscape: wired pool 49151 MB of 53084 MB the GPU can keep resident, 0 MB of it already in use
+[    0.15] [INFO] resource-plan: 5 activation arena(s) declared, 3548 MB; peak across phases 2988 MB
+[    0.15] [INFO] resource-plan: 137344 MB of model weights declared before init (137344 MB of claims, before shared checkpoints are counted once)
+[    0.15] [INFO] resource-plan: 64201 MB preloaded / 10510 MB if every streamable component streams
+[    0.15] [INFO] resource-plan: 126834 MB of that is phase-limited; peak across phases 64201 MB
+[    0.15] [INFO] resource-plan: peak 11070 MB in phase 'decode' (condition 6740 MB, denoise 6678 MB, decode-audio 585 MB, decode 11070 MB)
+[    0.24] [INFO] memory-plan (declared): peak 9936 MB at 'vae-decode' streaming, 66198 MB at 'generate-video' preloaded, over 9 stages in running order (diffusion-conditioner 6162 MB, generate-video 6101 MB, vae-decode 9936 MB, rgb-to-video 0 MB, audio-vae-decode 577 MB)
+[    0.24] vpipe: launched pipeline 'h3-t2v-compare.vpipeline'
+[    0.24] [INFO] ModelSelectStage('model-select'): model = '/Users/jiangzhenguo/ai/h3/MiniMax-H3/FL2VA'
+[    0.24] [INFO] MiniMaxH3ModelConfigStage('minimax-h3-model-config'): shifts 12.0/3.0, condition t 1.000/1.000, audio as long as the video
+[    0.24] [INFO] GenerateVideoStage('generate-video'): MiniMax-H3 partition 'fl2va' (models DB says model_type '-', so probed the checkpoint)
+[    0.24] [INFO] GenerateVideoStage('generate-video'): MiniMax-H3 (video+audio) at 960x544x124 frames, 6 steps, shifts 12.0/3.0
+[    0.40] [INFO] AudioVaeDecodeStage('audio-vae-decode'): minimax-h3 audio VAE loaded -- 32000 Hz, 32 latent channels, hop 800 (40 latents/s), unload_when_idle=yes
+[    1.05] [INFO] DiffusionConditionerStage('diffusion-conditioner'): MiniMax-H3 encoder streams its 50 layers through a slot pair, the next read under this layer's GPU work; the layers it keeps grow into free memory as it runs
+[    1.05] [INFO] DiffusionConditionerStage('diffusion-conditioner'): family minimax-h3 encoder (Qwen3-VL-32B (layer-50 tap)), hidden 5120
+[    1.05] [INFO] DiffusionConditionerStage('diffusion-conditioner'): memory-bounded -- the encoder is dropped after each conditioning and reloaded on the next prompt
+[    8.29] [INFO] GenerateVideoStage('generate-video'): generation 1, seed 42
+[    8.37] [INFO] GenerateVideoStage('generate-video'): MiniMax-H3 footprint 38 GB (others 62 GB, less 24 GB the AdaLN bake retires) + 8 GB headroom -> STREAM blocks
+[    8.79] [INFO] GenerateVideoStage('generate-video'): memory-bounded -- the DiT is dropped after each clip so the VAE decode has working set, and reloads on the next prompt (its blocks stream, so the box is already tight)
+[    8.79] [INFO] memory-plan (generate-video): peak 9936 MB at 'vae-decode' streaming, 63624 MB at 'diffusion-conditioner' preloaded, over 9 stages in running order (diffusion-conditioner 6162 MB, generate-video 6101 MB, vae-decode 9936 MB, rgb-to-video 0 MB, audio-vae-decode 577 MB)
+[    8.79] [INFO] GenerateVideoStage('generate-video'): MiniMax-H3 DiT streams its 50 blocks; the resident set grows into free RAM as the denoise runs and is given back when the box needs it
+[    8.79] [INFO] GenerateVideoStage('generate-video'): reclaimable RAM ~38401 MB + up to 4096 MB the OS can swap (4096 MB allowed by swap_allowance_mb, 7402 MB other processes are actually holding); 5% margin
+[   12.89] [INFO] MetalMiniMaxH3Transformer: residency probe 50 blocks of 50 (735 MB each, 37748 MB reclaimable, wire budget 49151 MB) -- uncapped, the wire budget is the gate
+[   12.89] [NORMAL] MetalMiniMaxH3Transformer: baked AdaLN for 6 steps (11 rows) -- 51 projections (24870 MB of weights) replaced by 101 MB of tables, and no longer streamed per step
+[   19.02] [NORMAL] MetalMiniMaxH3Transformer: rope table bf16, angles fp32 -- matching ComfyUI / diffusers
+[   19.04] [NORMAL] [h3-dit] first forward at 19386 rows: 6149 ms before block 0 (scratch 3, residency+wire 162, gemm autotune 5970, rope/temb/attn setup 15)
+[   19.26] [PROGRESS] 0% of 'denoise' completed at 23:25:47 (0/300)
+[   30.91] [NORMAL] MetalMiniMaxH3Transformer: attention query tile -> BQ 128 (per-block median: BQ 64 0.0 ms, BQ 128 0.0 ms over 6 probe blocks)
+[   64.48] [PROGRESS] 10% of 'denoise' completed at 23:26:33 (30/300)
+[   96.44] [INFO] [h3-dit] 19386 rows (102 text + 0 cond + 414 audio + 18870 video), 50 blocks, 1 timesteps, 77409 ms total
+[   96.44]   input+refiner      8.4 ms   adaln   8093.8 ms (     3 GF/s)
+[   96.44]   qkv    11021.7 ms ( 20334 GF/s)   o-proj   3703.8 ms ( 20170 GF/s)
+[   96.44]   ff     23232.1 ms ( 19293 GF/s)   attn    29454.4 ms ( 18292 GF/s, steel flash)
+[   96.44]   prep     827.5 ms   elt    867.7 ms   final    190.1 ms
+[   96.44]   vdn        0.0 ms (no branch attached), weights      0.0 ms, softmax gate      0.0 ms
+[  111.25] [PROGRESS] 20% of 'denoise' completed at 23:27:19 (60/300)
+[  157.18] [PROGRESS] 30% of 'denoise' completed at 23:28:05 (90/300)
+[  173.03] [INFO] [h3-dit] 19386 rows (102 text + 0 cond + 414 audio + 18870 video), 50 blocks, 2 timesteps, 76507 ms total
+[  173.03]   input+refiner      7.8 ms   adaln      2.4 ms ( 21717 GF/s)
+[  173.03]   qkv    11584.7 ms ( 19346 GF/s)   o-proj   3898.2 ms ( 19164 GF/s)
+[  173.03]   ff     24543.4 ms ( 18263 GF/s)   attn    34635.5 ms ( 15555 GF/s, steel flash)
+[  173.03]   prep     905.8 ms   elt    918.7 ms   final      5.3 ms
+[  173.03]   vdn        0.0 ms (no branch attached), weights      0.0 ms, softmax gate      0.0 ms
+[  205.40] [PROGRESS] 40% of 'denoise' completed at 23:28:54 (120/300)
+[  254.59] [INFO] [h3-dit] 19386 rows (102 text + 0 cond + 414 audio + 18870 video), 50 blocks, 2 timesteps, 81530 ms total
+[  254.59]   input+refiner      6.8 ms   adaln      2.8 ms ( 18625 GF/s)
+[  254.59]   qkv    12025.4 ms ( 18637 GF/s)   o-proj   4110.2 ms ( 18176 GF/s)
+[  254.59]   ff     25856.3 ms ( 17335 GF/s)   attn    37607.3 ms ( 14326 GF/s, steel flash)
+[  254.59]   prep     945.4 ms   elt    961.5 ms   final      7.7 ms
+[  254.59]   vdn        0.0 ms (no branch attached), weights      0.0 ms, softmax gate      0.0 ms
+[  254.63] [PROGRESS] 50% of 'denoise' completed at 23:29:43 (150/300)
+[  303.59] [PROGRESS] 60% of 'denoise' completed at 23:30:32 (180/300)
+[  336.07] [INFO] [h3-dit] 19386 rows (102 text + 0 cond + 414 audio + 18870 video), 50 blocks, 2 timesteps, 81457 ms total
+[  336.07]   input+refiner      7.6 ms   adaln      2.5 ms ( 20579 GF/s)
+[  336.07]   qkv    12010.3 ms ( 18660 GF/s)   o-proj   4099.0 ms ( 18225 GF/s)
+[  336.07]   ff     25839.9 ms ( 17346 GF/s)   attn    37605.0 ms ( 14327 GF/s, steel flash)
+[  336.07]   prep     937.5 ms   elt    943.1 ms   final      6.3 ms
+[  336.07]   vdn        0.0 ms (no branch attached), weights      0.0 ms, softmax gate      0.0 ms
+[  352.36] [PROGRESS] 70% of 'denoise' completed at 23:31:20 (210/300)
+[  400.72] [PROGRESS] 80% of 'denoise' completed at 23:32:09 (240/300)
+[  416.63] [INFO] [h3-dit] 19386 rows (102 text + 0 cond + 414 audio + 18870 video), 50 blocks, 2 timesteps, 80536 ms total
+[  416.63]   input+refiner      7.2 ms   adaln      2.5 ms ( 20914 GF/s)
+[  416.63]   qkv    11902.1 ms ( 18830 GF/s)   o-proj   4051.6 ms ( 18438 GF/s)
+[  416.63]   ff     25549.1 ms ( 17544 GF/s)   attn    37139.2 ms ( 14507 GF/s, steel flash)
+[  416.63]   prep     936.6 ms   elt    936.7 ms   final      5.6 ms
+[  416.63]   vdn        0.0 ms (no branch attached), weights      0.0 ms, softmax gate      0.0 ms
+[  449.01] [PROGRESS] 90% of 'denoise' completed at 23:32:57 (270/300)
+[  496.84] [INFO] [h3-dit] 19386 rows (102 text + 0 cond + 414 audio + 18870 video), 50 blocks, 2 timesteps, 80183 ms total
+[  496.84]   input+refiner      7.0 ms   adaln      2.6 ms ( 20218 GF/s)
+[  496.84]   qkv    11853.6 ms ( 18907 GF/s)   o-proj   4035.5 ms ( 18512 GF/s)
+[  496.84]   ff     25467.0 ms ( 17600 GF/s)   attn    36880.4 ms ( 14609 GF/s, steel flash)
+[  496.84]   prep     953.9 ms   elt    969.2 ms   final      8.1 ms
+[  496.84]   vdn        0.0 ms (no branch attached), weights      0.0 ms, softmax gate      0.0 ms
+[  496.86] [INFO] memory-plan (generate-video): peak 41421 MB at 'generate-video' streaming, 63624 MB at 'diffusion-conditioner' preloaded, over 9 stages in running order (diffusion-conditioner 6162 MB, generate-video 41421 MB, vae-decode 9936 MB, rgb-to-video 0 MB, audio-vae-decode 577 MB)
+[  496.86] [INFO] GenerateVideoStage('generate-video'): DiT residency ended at 50 of 50 blocks (36751 MB), 0 pinned at load
+[  496.88] [PROGRESS] 'denoise' ended at 23:33:45, last reported 99% (299/300)
+[  498.61] [INFO] GenerateVideoStage('generate-video'): emitted MiniMax-H3 latents #1 -- video [24, 37, 34, 60] + audio [2, 32, 207]
+[  498.62] [INFO] VaeDecodeStage('vae-decode'): loading the MiniMax-H3 video VAE from '/Users/jiangzhenguo/ai/h3/MiniMax-H3/FL2VA/video_vae'
+[  498.83] [INFO] AudioVaeDecodeStage('audio-vae-decode'): decoded clip #1 -- 207 latent frames -> 2 x 165600 samples (5.17 s at 32000 Hz)
+[  500.90] [PROGRESS] 0% of 'vae decode' completed at 23:33:49 (0/105)
+[  507.40] [PROGRESS] 10% of 'vae decode' completed at 23:33:56 (11/105)
+[  513.73] [PROGRESS] 20% of 'vae decode' completed at 23:34:02 (21/105)
+[  520.61] [PROGRESS] 30% of 'vae decode' completed at 23:34:09 (32/105)
+[  526.85] [PROGRESS] 40% of 'vae decode' completed at 23:34:15 (42/105)
+[  533.85] [PROGRESS] 50% of 'vae decode' completed at 23:34:22 (53/105)
+[  540.06] [PROGRESS] 60% of 'vae decode' completed at 23:34:28 (63/105)
+[  547.00] [PROGRESS] 70% of 'vae decode' completed at 23:34:35 (74/105)
+[  553.32] [PROGRESS] 80% of 'vae decode' completed at 23:34:41 (84/105)
+[  560.20] [PROGRESS] 90% of 'vae decode' completed at 23:34:48 (95/105)
+[  566.42] [PROGRESS] 100% of 'vae decode' completed at 23:34:55 (105/105)
+[  566.88] [INFO] PipelineRuntime: pipeline 'h3-t2v-compare' ran for 9 m 27 s
+[  566.95]       566.97 real         7.08 user        18.28 sys
+[  566.95]          44152061952  maximum resident set size
+[  566.95]                    0  average shared memory size
+[  566.95]                    0  average unshared data size
+[  566.95]                    0  average unshared stack size
+[  566.95]              7042629  page reclaims
+[  566.95]                 2187  page faults
+[  566.95]                    0  swaps
+[  566.95]                    0  block input operations
+[  566.95]                    0  block output operations
+[  566.95]                    0  messages sent
+[  566.95]                    0  messages received
+[  566.95]                    0  signals received
+[  566.95]               124296  voluntary context switches
+[  566.95]               117936  involuntary context switches
+[  566.95]         216965290175  instructions retired
+[  566.95]          96640805912  cycles elapsed
+[  566.95]          45489636232  peak memory footprint

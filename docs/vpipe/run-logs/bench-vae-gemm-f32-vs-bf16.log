@@ -1,0 +1,63 @@
+
+=== rows = 1289 (one VAE tile-unit) ===
+ -- qkv  2048->6144
+  f32  (MPS float32, current VAE)      0.0049 s    6612.06 GFLOP/s
+  bf16 (MPS bfloat16, proposed)        0.0012 s   26964.88 GFLOP/s
+  bf16 (NAX tensor-core, no bias)      0.0012 s   25971.78 GFLOP/s
+ -- out  2048->2048
+  f32  (MPS float32, current VAE)      0.0018 s    6171.76 GFLOP/s
+  bf16 (MPS bfloat16, proposed)        0.0005 s   21160.30 GFLOP/s
+  bf16 (NAX tensor-core, no bias)      0.0005 s   21712.68 GFLOP/s
+ -- fc1  2048->16384
+  f32  (MPS float32, current VAE)      0.0125 s    6894.34 GFLOP/s
+  bf16 (MPS bfloat16, proposed)        0.0029 s   29880.25 GFLOP/s
+  bf16 (NAX tensor-core, no bias)      0.0029 s   29828.73 GFLOP/s
+ -- fc2   8192->2048
+  f32  (MPS float32, current VAE)      0.0073 s    5898.22 GFLOP/s
+  bf16 (MPS bfloat16, proposed)        0.0018 s   24042.06 GFLOP/s
+  bf16 (NAX tensor-core, no bias)      0.0018 s   24176.45 GFLOP/s
+ -- attention 32 heads x 64 dim
+  f32  sdpa                            0.0024 s    5631.44 GFLOP/s
+  bf16 sdpa                            0.0007 s   19116.82 GFLOP/s
+
+=== rows = 10240 (one VAE tile-unit) ===
+ -- qkv  2048->6144
+  f32  (MPS float32, current VAE)      0.0412 s    6252.53 GFLOP/s
+  bf16 (MPS bfloat16, proposed)        0.0092 s   27937.78 GFLOP/s
+  bf16 (NAX tensor-core, no bias)      0.0098 s   26290.35 GFLOP/s
+ -- out  2048->2048
+  f32  (MPS float32, current VAE)      0.0130 s    6612.22 GFLOP/s
+  bf16 (MPS bfloat16, proposed)        0.0031 s   28071.68 GFLOP/s
+  bf16 (NAX tensor-core, no bias)      0.0031 s   28126.83 GFLOP/s
+ -- fc1  2048->16384
+  f32  (MPS float32, current VAE)      0.1090 s    6306.85 GFLOP/s
+  bf16 (MPS bfloat16, proposed)        0.0250 s   27484.49 GFLOP/s
+  bf16 (NAX tensor-core, no bias)      0.0251 s   27377.19 GFLOP/s
+ -- fc2   8192->2048
+  f32  (MPS float32, current VAE)      0.0536 s    6405.86 GFLOP/s
+  bf16 (MPS bfloat16, proposed)        0.0133 s   25780.12 GFLOP/s
+  bf16 (NAX tensor-core, no bias)      0.0129 s   26693.40 GFLOP/s
+ -- attention 32 heads x 64 dim
+  f32  sdpa                            0.1367 s    6285.49 GFLOP/s
+  bf16 sdpa                            0.0328 s   26216.80 GFLOP/s
+
+=== rows = 15360 (one VAE tile-unit) ===
+ -- qkv  2048->6144
+  f32  (MPS float32, current VAE)      0.0614 s    6297.50 GFLOP/s
+  bf16 (MPS bfloat16, proposed)        0.0146 s   26463.14 GFLOP/s
+  bf16 (NAX tensor-core, no bias)      0.0145 s   26597.88 GFLOP/s
+ -- out  2048->2048
+  f32  (MPS float32, current VAE)      0.0198 s    6513.45 GFLOP/s
+  bf16 (MPS bfloat16, proposed)        0.0045 s   28525.35 GFLOP/s
+  bf16 (NAX tensor-core, no bias)      0.0045 s   28626.75 GFLOP/s
+ -- fc1  2048->16384
+  f32  (MPS float32, current VAE)      0.1629 s    6327.57 GFLOP/s
+  bf16 (MPS bfloat16, proposed)        0.0384 s   26868.74 GFLOP/s
+  bf16 (NAX tensor-core, no bias)      0.0381 s   27022.29 GFLOP/s
+ -- fc2   8192->2048
+  f32  (MPS float32, current VAE)      0.0820 s    6288.00 GFLOP/s
+  bf16 (MPS bfloat16, proposed)        0.0204 s   25302.96 GFLOP/s
+  bf16 (NAX tensor-core, no bias)      0.0199 s   25943.63 GFLOP/s
+ -- attention 32 heads x 64 dim
+  f32  sdpa                            0.3279 s    5895.07 GFLOP/s
+  bf16 sdpa                            0.0767 s   25214.74 GFLOP/s

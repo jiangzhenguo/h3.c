@@ -1,0 +1,7 @@
+[00:17:12] ===== COOLDOWN 600s before bf16 run =====
+[00:27:12] ===== h3.c bf16 (default) =====
+[00:32:29] h3.c bf16 exit=0
+[00:32:29] ===== COOLDOWN 600s before f32 run =====
+[00:42:29] ===== h3.c f32 (baseline path) =====
+[00:49:19] h3.c f32 exit=0
+[00:49:19] ===== DONE =====

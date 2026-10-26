@@ -1,5 +1,7 @@
 # h3-metal
 
+> 中文版：[README.zh-CN.md](README.zh-CN.md)
+
 Native MiniMax-H3 inference for Apple Silicon. The project is being built as a
 sequence of working vertical slices: deterministic host/model metadata first,
 then portable Metal block parity, prompt encoding, prompt-to-video/audio, and
@@ -809,3 +811,10 @@ at every size for A/B comparison.
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
 trees. Model phases are loaded and released separately so the 33B transformer,
 Qwen encoder, and decoders never have to coexist in unified memory.
+
+## Local notes (fork)
+
+This fork tracks a local, same-machine comparison against VPIPE and the video
+VAE BF16 rewrite that came out of it. The full reports, reproduction scripts,
+raw logs, patches and rendered media are archived in
+[`docs/vpipe/`](docs/vpipe/).

@@ -1,0 +1,2126 @@
+From d70e9d71caba2fa378423851463ca435b578b6cf Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <agent@local>
+Date: Sun, 25 Oct 2026 00:51:54 +0800
+Subject: [PATCH] Video VAE: run the ViT decoder in BF16 so MPS uses the tensor
+ cores
+
+The MiniMax-H3 video VAE decoder was a 36-layer / 2048-wide ViT that ran
+entirely in FP32.  MPS FP32 matmul is a plain FP32 SIMD path, so the
+Apple tensor cores sat idle: a micro-benchmark at the decoder's real
+shapes measured 6.2 TFLOP/s, which is the M5 Pro's FP32 SIMD peak.
+
+Switching the decoder to BF16 moves the same GEMMs onto the tensor
+cores (26 TFLOP/s measured, ~4x) and cuts the 960x544x124 decode from
+159.45 s to 47.33 s (3.37x), 409.95 s to 316.93 s end to end, with the
+video VAE peak allocation halved from 9.37 GiB to 4.68 GiB.  Relative
+error against the FP32 decoder is 0.0048, versus the 0.02 bound VPIPE
+uses for its own decoder.
+
+Two new BF16 primitives fill the last gaps in the BF16 path:
+h3_scale_add_bf16 and h3_video_qkv_rope_bf16 mirror their FP32
+counterparts line for line, including the half-split RoPE sign handling
+and the QK RMS epsilon placement.  Both are registered in the pipeline
+warm-up list.
+
+The checkpoint stores all 560 decoder tensors as FP32, so
+h3_weight_load_f32_as_bf16 converts them on the host with
+round-to-nearest-even before upload.  That costs 0.18 s for the full
+9.7 GiB set against 112 s saved, and resident weights drop from
+9.16 GiB to 4.58 GiB.
+
+Also align the spatial tile size with the checkpoint.  The old code
+auto-tuned it to 304 px, but the config specifies vae_tile_size 256, and
+the RoPE grid is normalised by the tile's own latent extent, so 304 px
+silently evaluates a different position encoding than the model was
+trained with.  256 px is now the default; H3_VAE_TILE_PIXELS still
+overrides it.
+
+H3_VAE_PRECISION=f32 restores the original FP32 path for A/B runs and
+regression testing.
+---
+ Makefile                  |  18 +-
+ h3_gpu.h                  |  13 +
+ h3_gpu.m                  |  65 ++++
+ h3_shaders.metal          |  63 +++
+ h3_video_vae.c            | 318 ++++++++++++----
+ h3_weights.c              |  74 ++++
+ h3_weights.h              |  27 ++
+ tests/test_gpu_bf16_ops.c | 784 ++++++++++++++++++++++++++++++++++++++
+ tests/test_video_vae.c    | 368 ++++++++++++++++++
+ 9 files changed, 1654 insertions(+), 76 deletions(-)
+ create mode 100644 tests/test_gpu_bf16_ops.c
+ create mode 100644 tests/test_video_vae.c
+
+diff --git a/Makefile b/Makefile
+index bb20237..dde1947 100644
+--- a/Makefile
++++ b/Makefile
+@@ -94,6 +94,12 @@ tests/bench_dit_864.o: tests/bench_dit.c
+ h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
+ 	$(CC) -o $@ $^ $(LDLIBS)
+ 
++h3_video_vae_tests: tests/test_video_vae.o $(LIB_OBJ)
++	$(CC) -o $@ $^ $(LDLIBS)
++
++h3_gpu_bf16_ops_tests: tests/test_gpu_bf16_ops.o $(LIB_OBJ)
++	$(CC) -o $@ $^ $(LDLIBS)
++
+ h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
+ 	$(CC) -o $@ $^ $(LDLIBS)
+ 
+@@ -101,9 +107,11 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
+ 	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
+ 	h3_av_mux_test \
+ 	h3_real_video_encoder_test h3_real_qwen_vision_test \
+-	h3_real_multimodal_text_test h3_real_ref_video_text_test
++	h3_real_multimodal_text_test h3_real_ref_video_text_test \
++	h3_video_vae_tests h3_gpu_bf16_ops_tests
+ 
+ 	./h3_tests
++	./h3_gpu_bf16_ops_tests
+ 	@if test -f misc/fixtures/h3_dit.safetensors && \
+ 	         test -f misc/fixtures/h3_dit_bf16.safetensors; then \
+ 		./h3_metal_tests misc/fixtures/h3_dit.safetensors; \
+@@ -165,6 +173,11 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
+ 	else \
+ 		echo "skip: released Qwen video-pair fixture is not installed"; \
+ 	fi
++	@if test -f MiniMax-H3/FL2VA/video_vae/source/model.safetensors; then \
++		./h3_video_vae_tests MiniMax-H3; \
++	else \
++		echo "skip: released video VAE weights are not installed"; \
++	fi
+ 	@if test -f MiniMax-H3/FL2VA/text_encoder/model-00001-of-00014.safetensors && \
+ 	         test -f misc/fixtures/h3_real_multimodal_text_64.safetensors; then \
+ 		./h3_real_multimodal_text_test; \
+@@ -210,6 +223,7 @@ clean:
+ 		h3_real_video_encoder_test h3_real_qwen_vision_test \
+ 		h3_real_multimodal_text_test h3_real_ref_video_text_test \
+ 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
+-		h3_real_video_vae_test h3_semantic_vae_test \
++		h3_real_video_vae_test h3_semantic_vae_test h3_video_vae_tests \
++		h3_gpu_bf16_ops_tests \
+ 	h3_dit_bench h3_dit_bench_864 \
+ 	libh3.a *.o *.d tests/*.o tests/*.d
+diff --git a/h3_gpu.h b/h3_gpu.h
+index 3a47cc3..438491c 100644
+--- a/h3_gpu.h
++++ b/h3_gpu.h
+@@ -187,6 +187,19 @@ int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
+                               uint32_t sequence, uint32_t heads,
+                               uint32_t head_dim, uint32_t rope_half,
+                               float epsilon);
++int h3_gpu_scale_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
++                          const h3_gpu_tensor *residual,
++                          const h3_gpu_tensor *branch,
++                          const h3_gpu_tensor *scale, uint32_t rows,
++                          uint32_t width);
++int h3_gpu_video_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
++                               h3_gpu_tensor *key, h3_gpu_tensor *value,
++                               const h3_gpu_tensor *qkv,
++                               const h3_gpu_tensor *rope_cos,
++                               const h3_gpu_tensor *rope_sin,
++                               uint32_t sequence, uint32_t heads,
++                               uint32_t head_dim, uint32_t rope_half,
++                               float epsilon);
+ 
+ /* H3 AudioVAE uses time-major [batch,length,channels] activations and stores
+  * Conv1d/ConvTranspose1d weights in PyTorch OIK/IOK order respectively. */
+diff --git a/h3_gpu.m b/h3_gpu.m
+index c61d04c..72a6929 100644
+--- a/h3_gpu.m
++++ b/h3_gpu.m
+@@ -410,6 +410,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
+             @"h3_rms_norm_f32",
+             @"h3_scale_add_f32", @"h3_layer_norm_f32",
+             @"h3_video_qkv_rope_f32",
++            @"h3_scale_add_bf16", @"h3_video_qkv_rope_bf16",
+             @"h3_adaln_f32", @"h3_gate_f32", @"h3_qkv_rope_f32",
+             @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_silu_bf16",
+             @"h3_rms_norm_bf16", @"h3_adaln_bf16", @"h3_gate_bf16",
+@@ -1652,6 +1653,32 @@ int h3_gpu_scale_add_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+         });
+ }
+ 
++int h3_gpu_scale_add_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
++                          const h3_gpu_tensor *residual,
++                          const h3_gpu_tensor *branch,
++                          const h3_gpu_tensor *scale, uint32_t rows,
++                          uint32_t width) {
++    H3GPU *gpu = GPU(opaque);
++    size_t count = (size_t)rows * width;
++    if (!h3_gpu_require_elements(gpu, residual, count, @"scale-add residual") ||
++        TENSOR(residual).dtype != H3_GPU_BF16 ||
++        !h3_gpu_require_elements(gpu, branch, count, @"scale-add branch") ||
++        TENSOR(branch).dtype != H3_GPU_BF16 ||
++        !h3_gpu_require_elements(gpu, scale, width, @"scale-add scale") ||
++        TENSOR(scale).dtype != H3_GPU_BF16 ||
++        !h3_gpu_require_elements(gpu, output, count, @"scale-add output") ||
++        TENSOR(output).dtype != H3_GPU_BF16) return 0;
++    swiglu_args args = {rows, width};
++    return h3_gpu_dispatch_2d(gpu, @"h3_scale_add_bf16", width, rows,
++        ^(id<MTLComputeCommandEncoder> encoder) {
++            [encoder setBuffer:TENSOR(residual).buffer offset:0 atIndex:0];
++            [encoder setBuffer:TENSOR(branch).buffer offset:0 atIndex:1];
++            [encoder setBuffer:TENSOR(scale).buffer offset:0 atIndex:2];
++            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
++            [encoder setBytes:&args length:sizeof(args) atIndex:4];
++        });
++}
++
+ int h3_gpu_layer_norm_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *weight,
+@@ -1716,6 +1743,44 @@ int h3_gpu_video_qkv_rope_f32(h3_gpu *opaque, h3_gpu_tensor *query,
+         });
+ }
+ 
++int h3_gpu_video_qkv_rope_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
++                               h3_gpu_tensor *key, h3_gpu_tensor *value,
++                               const h3_gpu_tensor *qkv,
++                               const h3_gpu_tensor *rope_cos,
++                               const h3_gpu_tensor *rope_sin,
++                               uint32_t sequence, uint32_t heads,
++                               uint32_t head_dim, uint32_t rope_half,
++                               float epsilon) {
++    H3GPU *gpu = GPU(opaque);
++    size_t inner = (size_t)heads * head_dim;
++    size_t count = (size_t)sequence * inner;
++    size_t rope_count = (size_t)sequence * rope_half;
++    if (!h3_gpu_require_elements(gpu, qkv, count * 3, @"video QKV") ||
++        TENSOR(qkv).dtype != H3_GPU_BF16 ||
++        !h3_gpu_require_elements(gpu, rope_cos, rope_count, @"video RoPE cosine") ||
++        TENSOR(rope_cos).dtype != H3_GPU_BF16 ||
++        !h3_gpu_require_elements(gpu, rope_sin, rope_count, @"video RoPE sine") ||
++        TENSOR(rope_sin).dtype != H3_GPU_BF16 ||
++        !h3_gpu_require_elements(gpu, query, count, @"video query") ||
++        TENSOR(query).dtype != H3_GPU_BF16 ||
++        !h3_gpu_require_elements(gpu, key, count, @"video key") ||
++        TENSOR(key).dtype != H3_GPU_BF16 ||
++        !h3_gpu_require_elements(gpu, value, count, @"video value") ||
++        TENSOR(value).dtype != H3_GPU_BF16 || rope_half * 2 > head_dim) return 0;
++    qkv_args args = {sequence, heads, head_dim, rope_half, 0, epsilon};
++    return h3_gpu_dispatch_3d(gpu, @"h3_video_qkv_rope_bf16",
++        MTLSizeMake(head_dim, heads, sequence),
++        ^(id<MTLComputeCommandEncoder> encoder) {
++            [encoder setBuffer:TENSOR(qkv).buffer offset:0 atIndex:0];
++            [encoder setBuffer:TENSOR(rope_cos).buffer offset:0 atIndex:1];
++            [encoder setBuffer:TENSOR(rope_sin).buffer offset:0 atIndex:2];
++            [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:3];
++            [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:4];
++            [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:5];
++            [encoder setBytes:&args length:sizeof(args) atIndex:6];
++        });
++}
++
+ static H3Conv *h3_gpu_conv_graph(H3GPU *gpu, uint32_t batch,
+                                  uint32_t length, uint32_t input_channels,
+                                  uint32_t output_channels, uint32_t kernel,
+diff --git a/h3_shaders.metal b/h3_shaders.metal
+index 36316f5..9d60c5d 100644
+--- a/h3_shaders.metal
++++ b/h3_shaders.metal
+@@ -256,6 +256,21 @@ kernel void h3_scale_add_f32(device const float *residual [[buffer(0)]],
+     output[index] = residual[index] + branch[index] * scale[column];
+ }
+ 
++kernel void h3_scale_add_bf16(device const ushort *residual [[buffer(0)]],
++                               device const ushort *branch [[buffer(1)]],
++                               device const ushort *scale [[buffer(2)]],
++                               device ushort *output [[buffer(3)]],
++                               constant scale_add_args &args [[buffer(4)]],
++                               uint2 gid [[thread_position_in_grid]]) {
++    uint column = gid.x;
++    uint row = gid.y;
++    if (row >= args.rows || column >= args.width) return;
++    uint index = row * args.width + column;
++    float value = h3_bf16_to_f32(residual[index]) +
++                  h3_bf16_to_f32(branch[index]) * h3_bf16_to_f32(scale[column]);
++    output[index] = h3_f32_to_bf16(value);
++}
++
+ kernel void h3_layer_norm_f32(device const float *input [[buffer(0)]],
+                               device const float *weight [[buffer(1)]],
+                               device const float *bias [[buffer(2)]],
+@@ -345,6 +360,54 @@ kernel void h3_video_qkv_rope_f32(
+     value[output_index] = qkv[base + args.head_dim * 2 + dimension];
+ }
+ 
++kernel void h3_video_qkv_rope_bf16(
++                            device const ushort *qkv [[buffer(0)]],
++                            device const ushort *rope_cos [[buffer(1)]],
++                            device const ushort *rope_sin [[buffer(2)]],
++                            device ushort *query [[buffer(3)]],
++                            device ushort *key [[buffer(4)]],
++                            device ushort *value [[buffer(5)]],
++                            constant qkv_args &args [[buffer(6)]],
++                            uint3 gid [[thread_position_in_grid]]) {
++    uint dimension = gid.x;
++    uint head = gid.y;
++    uint row = gid.z;
++    if (dimension >= args.head_dim || head >= args.heads || row >= args.sequence) return;
++    uint base = (row * args.heads + head) * args.head_dim * 3;
++    float q_sum = 0.0f, k_sum = 0.0f;
++    for (uint d = 0; d < args.head_dim; d++) {
++        float q = h3_bf16_to_f32(qkv[base + d]);
++        float k = h3_bf16_to_f32(qkv[base + args.head_dim + d]);
++        q_sum = fma(q, q, q_sum);
++        k_sum = fma(k, k, k_sum);
++    }
++    float qi = rsqrt(q_sum / float(args.head_dim) + args.epsilon);
++    float ki = rsqrt(k_sum / float(args.head_dim) + args.epsilon);
++    float q0 = h3_bf16_to_f32(qkv[base + dimension]) * qi;
++    float k0 = h3_bf16_to_f32(qkv[base + args.head_dim + dimension]) * ki;
++    if (dimension < args.rope_half) {
++        uint pair = dimension + args.rope_half;
++        float q1 = h3_bf16_to_f32(qkv[base + pair]) * qi;
++        float k1 = h3_bf16_to_f32(qkv[base + args.head_dim + pair]) * ki;
++        float c = h3_bf16_to_f32(rope_cos[row * args.rope_half + dimension]);
++        float s = h3_bf16_to_f32(rope_sin[row * args.rope_half + dimension]);
++        q0 = q0 * c - q1 * s;
++        k0 = k0 * c - k1 * s;
++    } else if (dimension < args.rope_half * 2) {
++        uint pair = dimension - args.rope_half;
++        float q1 = h3_bf16_to_f32(qkv[base + pair]) * qi;
++        float k1 = h3_bf16_to_f32(qkv[base + args.head_dim + pair]) * ki;
++        float c = h3_bf16_to_f32(rope_cos[row * args.rope_half + pair]);
++        float s = h3_bf16_to_f32(rope_sin[row * args.rope_half + pair]);
++        q0 = q0 * c + q1 * s;
++        k0 = k0 * c + k1 * s;
++    }
++    uint output_index = (row * args.heads + head) * args.head_dim + dimension;
++    query[output_index] = h3_f32_to_bf16(q0);
++    key[output_index] = h3_f32_to_bf16(k0);
++    value[output_index] = qkv[base + args.head_dim * 2 + dimension];
++}
++
+ struct adaln_args {
+     uint rows;
+     uint width;
+diff --git a/h3_video_vae.c b/h3_video_vae.c
+index 149e113..c6b8242 100644
+--- a/h3_video_vae.c
++++ b/h3_video_vae.c
+@@ -9,6 +9,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <strings.h>
+ 
+ enum {
+     LATENT_CHANNELS = 24,
+@@ -55,6 +56,8 @@ typedef struct {
+ typedef struct {
+     h3_gpu *gpu;
+     h3_weight_store *weights;
++    /* 1 selects the BF16 tensor-core path, 0 keeps the legacy F32 path. */
++    int bf16;
+     vae_block blocks[LAYERS];
+     h3_gpu_tensor *post_w;
+     h3_gpu_tensor *post_b;
+@@ -66,6 +69,7 @@ typedef struct {
+     h3_gpu_tensor *proj_w;
+     h3_gpu_tensor *proj_b;
+     h3_gpu_tensor *latent;
++    h3_gpu_tensor *latent_bf16;
+     h3_gpu_tensor *post;
+     h3_gpu_tensor *patch_hidden;
+     h3_gpu_tensor *hidden;
+@@ -119,23 +123,146 @@ static void free_tensor(h3_gpu_tensor **tensor) {
+     *tensor = NULL;
+ }
+ 
+-static h3_gpu_tensor *load_f32(vae_context *vae, const char *name, int ndim,
+-                               const uint64_t *shape, char *error,
+-                               size_t error_size) {
+-    return h3_weight_load_f32(vae->weights, vae->gpu, name, ndim, shape,
+-                              error, error_size);
++/* The decoder runs in BF16 by default so the MPS matmul and SDPA paths can
++ * use the Apple tensor cores. H3_VAE_PRECISION=f32 restores the original
++ * float32 path for A/B comparisons and regression runs. */
++static int vae_prefers_bf16(void) {
++    const char *value = getenv("H3_VAE_PRECISION");
++    if (value && *value) {
++        if (strcasecmp(value, "f32") == 0 || strcasecmp(value, "fp32") == 0 ||
++            strcasecmp(value, "float32") == 0) return 0;
++        if (strcasecmp(value, "bf16") == 0 ||
++            strcasecmp(value, "bfloat16") == 0) return 1;
++    }
++    return 1;
++}
++
++static h3_gpu_tensor *alloc_activation(vae_context *vae, size_t elements) {
++    return vae->bf16 ? h3_gpu_tensor_new_bf16(vae->gpu, elements)
++                      : h3_gpu_tensor_new_f32(vae->gpu, elements);
++}
++
++static h3_gpu_tensor *make_zero(vae_context *vae, size_t elements) {
++    static const float zeros_f32[HIDDEN] = {0};
++    static const uint16_t zeros_bf16[HIDDEN] = {0};
++    if (elements > HIDDEN) return NULL;
++    return vae->bf16 ? h3_gpu_tensor_from_bf16(vae->gpu, zeros_bf16, elements)
++                      : h3_gpu_tensor_from_f32(vae->gpu, zeros_f32, elements);
++}
++
++static int vae_rms_norm(vae_context *vae, h3_gpu_tensor *output,
++                         const h3_gpu_tensor *input,
++                         const h3_gpu_tensor *weight, uint32_t rows,
++                         uint32_t width, float epsilon) {
++    return vae->bf16 ?
++        h3_gpu_rms_norm_bf16(vae->gpu, output, input, weight, rows, width,
++                             epsilon) :
++        h3_gpu_rms_norm_f32(vae->gpu, output, input, weight, rows, width,
++                            epsilon);
++}
++
++static int vae_linear(vae_context *vae, h3_gpu_tensor *output,
++                      const h3_gpu_tensor *input,
++                      const h3_gpu_tensor *weight,
++                      const h3_gpu_tensor *bias, uint32_t rows,
++                      uint32_t input_dim, uint32_t output_dim) {
++    return vae->bf16 ?
++        h3_gpu_linear_bf16(vae->gpu, output, input, weight, bias, rows,
++                           input_dim, output_dim) :
++        h3_gpu_linear_f32(vae->gpu, output, input, weight, bias, rows,
++                          input_dim, output_dim);
++}
++
++static int vae_video_qkv_rope(vae_context *vae, h3_gpu_tensor *query,
++                              h3_gpu_tensor *key, h3_gpu_tensor *value,
++                              const h3_gpu_tensor *qkv,
++                              const h3_gpu_tensor *rope_cos,
++                              const h3_gpu_tensor *rope_sin, uint32_t sequence,
++                              uint32_t heads, uint32_t head_dim,
++                              uint32_t rope_half, float epsilon) {
++    return vae->bf16 ?
++        h3_gpu_video_qkv_rope_bf16(vae->gpu, query, key, value, qkv, rope_cos,
++                                   rope_sin, sequence, heads, head_dim,
++                                   rope_half, epsilon) :
++        h3_gpu_video_qkv_rope_f32(vae->gpu, query, key, value, qkv, rope_cos,
++                                  rope_sin, sequence, heads, head_dim,
++                                  rope_half, epsilon);
++}
++
++static int vae_sdpa(vae_context *vae, h3_gpu_tensor *output,
++                    const h3_gpu_tensor *query, const h3_gpu_tensor *key,
++                    const h3_gpu_tensor *value, uint32_t sequence,
++                    uint32_t heads, uint32_t head_dim, float scale) {
++    return vae->bf16 ?
++        h3_gpu_sdpa_bf16(vae->gpu, output, query, key, value, sequence, heads,
++                         head_dim, scale) :
++        h3_gpu_sdpa_f32(vae->gpu, output, query, key, value, sequence, heads,
++                        head_dim, scale);
++}
++
++static int vae_scale_add(vae_context *vae, h3_gpu_tensor *output,
++                          const h3_gpu_tensor *residual,
++                          const h3_gpu_tensor *branch,
++                          const h3_gpu_tensor *scale, uint32_t rows,
++                          uint32_t width) {
++    return vae->bf16 ?
++        h3_gpu_scale_add_bf16(vae->gpu, output, residual, branch, scale, rows,
++                              width) :
++        h3_gpu_scale_add_f32(vae->gpu, output, residual, branch, scale, rows,
++                             width);
++}
++
++static int vae_swiglu(vae_context *vae, h3_gpu_tensor *output,
++                      const h3_gpu_tensor *fused, uint32_t rows,
++                      uint32_t width) {
++    return vae->bf16 ?
++        h3_gpu_swiglu_bf16(vae->gpu, output, fused, rows, width) :
++        h3_gpu_swiglu_f32(vae->gpu, output, fused, rows, width);
++}
++
++static int vae_layer_norm(vae_context *vae, h3_gpu_tensor *output,
++                          const h3_gpu_tensor *input,
++                          const h3_gpu_tensor *weight,
++                          const h3_gpu_tensor *bias, uint32_t rows,
++                          uint32_t width, float epsilon) {
++    return vae->bf16 ?
++        h3_gpu_layer_norm_bf16(vae->gpu, output, input, weight, bias, rows,
++                               width, epsilon) :
++        h3_gpu_layer_norm_f32(vae->gpu, output, input, weight, bias, rows,
++                              width, epsilon);
++}
++
++static int vae_copy(vae_context *vae, h3_gpu_tensor *destination,
++                    size_t destination_offset,
++                    const h3_gpu_tensor *source, size_t source_offset,
++                    size_t elements) {
++    return vae->bf16 ?
++        h3_gpu_copy_bf16(vae->gpu, destination, destination_offset, source,
++                         source_offset, elements) :
++        h3_gpu_copy_f32(vae->gpu, destination, destination_offset, source,
++                        source_offset, elements);
++}
++
++static h3_gpu_tensor *load_weight(vae_context *vae, const char *name, int ndim,
++                                  const uint64_t *shape, char *error,
++                                  size_t error_size) {
++    return vae->bf16 ?
++        h3_weight_load_f32_as_bf16(vae->weights, vae->gpu, name, ndim, shape,
++                                   error, error_size) :
++        h3_weight_load_f32(vae->weights, vae->gpu, name, ndim, shape,
++                           error, error_size);
+ }
+ 
+ static h3_gpu_tensor *f1(vae_context *vae, const char *name, uint64_t width,
+                          char *error, size_t error_size) {
+     uint64_t shape[] = {width};
+-    return load_f32(vae, name, 1, shape, error, error_size);
++    return load_weight(vae, name, 1, shape, error, error_size);
+ }
+ 
+ static h3_gpu_tensor *f2(vae_context *vae, const char *name, uint64_t rows,
+                          uint64_t columns, char *error, size_t error_size) {
+     uint64_t shape[] = {rows, columns};
+-    return load_f32(vae, name, 2, shape, error, error_size);
++    return load_weight(vae, name, 2, shape, error, error_size);
+ }
+ 
+ static void free_block(vae_block *block) {
+@@ -154,7 +281,8 @@ static void cleanup(vae_context *vae) {
+     free_tensor(&vae->embed_w); free_tensor(&vae->embed_b);
+     free_tensor(&vae->registers); free_tensor(&vae->norm_out_w);
+     free_tensor(&vae->norm_out_b); free_tensor(&vae->proj_w);
+-    free_tensor(&vae->proj_b); free_tensor(&vae->latent); free_tensor(&vae->post);
++    free_tensor(&vae->proj_b); free_tensor(&vae->latent);
++    free_tensor(&vae->latent_bf16); free_tensor(&vae->post);
+     free_tensor(&vae->patch_hidden); free_tensor(&vae->hidden);
+     free_tensor(&vae->norm); free_tensor(&vae->qkv); free_tensor(&vae->query);
+     free_tensor(&vae->key); free_tensor(&vae->value); free_tensor(&vae->heads);
+@@ -201,8 +329,8 @@ static int load_block(vae_context *vae, int index, char *error,
+ static int load_input_weights(vae_context *vae, char *error,
+                               size_t error_size) {
+     uint64_t post_shape[] = {LATENT_CHANNELS, LATENT_CHANNELS, 1, 1, 1};
+-    vae->post_w = load_f32(vae, "post_quant_conv.weight", 5, post_shape,
+-                           error, error_size);
++    vae->post_w = load_weight(vae, "post_quant_conv.weight", 5, post_shape,
++                               error, error_size);
+     vae->post_b = f1(vae, "post_quant_conv.bias", LATENT_CHANNELS,
+                      error, error_size);
+     vae->embed_w = f2(vae, "decoder.x_embedder.weight", HIDDEN,
+@@ -210,8 +338,8 @@ static int load_input_weights(vae_context *vae, char *error,
+     vae->embed_b = f1(vae, "decoder.x_embedder.bias", HIDDEN,
+                       error, error_size);
+     uint64_t register_shape[] = {1, REGISTERS, HIDDEN};
+-    vae->registers = load_f32(vae, "decoder.register_tokens", 3,
+-                              register_shape, error, error_size);
++    vae->registers = load_weight(vae, "decoder.register_tokens", 3,
++                                 register_shape, error, error_size);
+     return vae->post_w && vae->post_b && vae->embed_w && vae->embed_b &&
+            vae->registers;
+ }
+@@ -383,8 +511,24 @@ static int prepare_rope(vae_context *vae, char *error, size_t error_size) {
+         }
+         row++;
+     }
+-    vae->rope_cos = h3_gpu_tensor_from_f32(vae->gpu, cosines, count);
+-    vae->rope_sin = h3_gpu_tensor_from_f32(vae->gpu, sines, count);
++    if (vae->bf16) {
++        uint16_t *packed_cos = malloc(count * sizeof(*packed_cos));
++        uint16_t *packed_sin = malloc(count * sizeof(*packed_sin));
++        if (packed_cos && packed_sin) {
++            for (size_t index = 0; index < count; index++) {
++                packed_cos[index] = h3_float_to_bf16(cosines[index]);
++                packed_sin[index] = h3_float_to_bf16(sines[index]);
++            }
++            vae->rope_cos = h3_gpu_tensor_from_bf16(vae->gpu, packed_cos,
++                                                     count);
++            vae->rope_sin = h3_gpu_tensor_from_bf16(vae->gpu, packed_sin,
++                                                     count);
++        }
++        free(packed_cos); free(packed_sin);
++    } else {
++        vae->rope_cos = h3_gpu_tensor_from_f32(vae->gpu, cosines, count);
++        vae->rope_sin = h3_gpu_tensor_from_f32(vae->gpu, sines, count);
++    }
+     free(cosines); free(sines);
+     if (!vae->rope_cos || !vae->rope_sin) {
+         fail(error, error_size, "cannot allocate video VAE RoPE: %s",
+@@ -397,26 +541,35 @@ static int prepare_rope(vae_context *vae, char *error, size_t error_size) {
+ static int allocate_activations(vae_context *vae, char *error,
+                                 size_t error_size) {
+     size_t patches = vae->patches, sequence = vae->sequence;
+-#define F32(field, elements) (vae->field = h3_gpu_tensor_new_f32(vae->gpu, (elements)))
++#define ALLOC(field, elements) (vae->field = alloc_activation(vae, (elements)))
+     h3_gpu_tensor *all[] = {
+-        F32(post, patches * LATENT_CHANNELS),
+-        F32(patch_hidden, patches * HIDDEN),
+-        F32(hidden, sequence * HIDDEN),
+-        F32(norm, sequence * HIDDEN),
+-        F32(qkv, sequence * INNER * 3),
+-        F32(query, sequence * INNER), F32(key, sequence * INNER),
+-        F32(value, sequence * INNER), F32(heads, sequence * INNER),
+-        F32(branch, sequence * HIDDEN), F32(ff1, sequence * FFN * 2),
+-        F32(activated, sequence * FFN),
+-        F32(projected, sequence * OUTPUT_PATCH)
++        ALLOC(post, patches * LATENT_CHANNELS),
++        ALLOC(patch_hidden, patches * HIDDEN),
++        ALLOC(hidden, sequence * HIDDEN),
++        ALLOC(norm, sequence * HIDDEN),
++        ALLOC(qkv, sequence * INNER * 3),
++        ALLOC(query, sequence * INNER), ALLOC(key, sequence * INNER),
++        ALLOC(value, sequence * INNER), ALLOC(heads, sequence * INNER),
++        ALLOC(branch, sequence * HIDDEN), ALLOC(ff1, sequence * FFN * 2),
++        ALLOC(activated, sequence * FFN),
++        ALLOC(projected, sequence * OUTPUT_PATCH)
+     };
+-#undef F32
++#undef ALLOC
+     for (size_t index = 0; index < sizeof(all) / sizeof(*all); index++)
+         if (!all[index]) {
+             fail(error, error_size, "cannot allocate video VAE activations: %s",
+                  h3_gpu_error(vae->gpu));
+             return 0;
+         }
++    if (vae->bf16) {
++        vae->latent_bf16 = h3_gpu_tensor_new_bf16(vae->gpu,
++                                                  patches * LATENT_CHANNELS);
++        if (!vae->latent_bf16) {
++            fail(error, error_size, "cannot allocate video VAE latent: %s",
++                 h3_gpu_error(vae->gpu));
++            return 0;
++        }
++    }
+     return 1;
+ }
+ 
+@@ -427,29 +580,29 @@ static int run_block(vae_context *vae, int index, char *error,
+ #define OP(call, label) do {                                                    \
+     if (!gpu_op(vae, (call), error, error_size, label)) return 0;               \
+ } while (0)
+-    OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden, weight->norm1,
++    OP(vae_rms_norm(vae, vae->norm, vae->hidden, weight->norm1,
+         rows, HIDDEN, 1e-5f), "video VAE attention norm");
+-    OP(h3_gpu_linear_f32(vae->gpu, vae->qkv, vae->norm, weight->qkv_w,
++    OP(vae_linear(vae, vae->qkv, vae->norm, weight->qkv_w,
+         weight->qkv_b, rows, HIDDEN, INNER * 3), "video VAE QKV");
+-    OP(h3_gpu_video_qkv_rope_f32(vae->gpu, vae->query, vae->key, vae->value,
++    OP(vae_video_qkv_rope(vae, vae->query, vae->key, vae->value,
+         vae->qkv, vae->rope_cos, vae->rope_sin, rows, HEADS, HEAD_DIM,
+         ROPE_HALF, 1e-5f), "video VAE QK norm/RoPE");
+-    OP(h3_gpu_sdpa_f32(vae->gpu, vae->heads, vae->query, vae->key, vae->value,
++    OP(vae_sdpa(vae, vae->heads, vae->query, vae->key, vae->value,
+         rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
+        "video VAE attention");
+-    OP(h3_gpu_linear_f32(vae->gpu, vae->branch, vae->heads, weight->out_w,
++    OP(vae_linear(vae, vae->branch, vae->heads, weight->out_w,
+         weight->out_b, rows, INNER, HIDDEN), "video VAE attention output");
+-    OP(h3_gpu_scale_add_f32(vae->gpu, vae->hidden, vae->hidden, vae->branch,
++    OP(vae_scale_add(vae, vae->hidden, vae->hidden, vae->branch,
+         weight->scale1, rows, HIDDEN), "video VAE attention residual");
+-    OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden, weight->norm2,
++    OP(vae_rms_norm(vae, vae->norm, vae->hidden, weight->norm2,
+         rows, HIDDEN, 1e-5f), "video VAE MLP norm");
+-    OP(h3_gpu_linear_f32(vae->gpu, vae->ff1, vae->norm, weight->w1,
++    OP(vae_linear(vae, vae->ff1, vae->norm, weight->w1,
+         weight->w1_b, rows, HIDDEN, FFN * 2), "video VAE MLP input");
+-    OP(h3_gpu_swiglu_f32(vae->gpu, vae->activated, vae->ff1, rows, FFN),
++    OP(vae_swiglu(vae, vae->activated, vae->ff1, rows, FFN),
+        "video VAE SwiGLU");
+-    OP(h3_gpu_linear_f32(vae->gpu, vae->branch, vae->activated, weight->w2,
++    OP(vae_linear(vae, vae->branch, vae->activated, weight->w2,
+         weight->w2_b, rows, FFN, HIDDEN), "video VAE MLP output");
+-    OP(h3_gpu_scale_add_f32(vae->gpu, vae->hidden, vae->hidden, vae->branch,
++    OP(vae_scale_add(vae, vae->hidden, vae->hidden, vae->branch,
+         weight->scale2, rows, HIDDEN), "video VAE MLP residual");
+ #undef OP
+     return 1;
+@@ -458,9 +611,7 @@ static int run_block(vae_context *vae, int index, char *error,
+ static int run_decoder(vae_context *vae, h3_video_vae_progress progress,
+                        void *progress_opaque, char *error,
+                        size_t error_size) {
+-    float zeros[HIDDEN];
+-    memset(zeros, 0, sizeof(zeros));
+-    h3_gpu_tensor *zero = h3_gpu_tensor_from_f32(vae->gpu, zeros, HIDDEN);
++    h3_gpu_tensor *zero = make_zero(vae, HIDDEN);
+     if (!zero) {
+         fail(error, error_size, "cannot allocate video VAE suffix token");
+         return 0;
+@@ -471,18 +622,23 @@ static int run_decoder(vae_context *vae, h3_video_vae_progress progress,
+     }                                                                           \
+ } while (0)
+     OP(h3_gpu_begin(vae->gpu), "begin video VAE decoder");
+-    OP(h3_gpu_linear_f32(vae->gpu, vae->post, vae->latent, vae->post_w,
++    if (vae->bf16)
++        OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->latent_bf16, vae->latent,
++                                   vae->patches * LATENT_CHANNELS),
++           "cast video VAE latent to BF16");
++    const h3_gpu_tensor *latent = vae->bf16 ? vae->latent_bf16 : vae->latent;
++    OP(vae_linear(vae, vae->post, latent, vae->post_w,
+         vae->post_b, vae->patches, LATENT_CHANNELS, LATENT_CHANNELS),
+        "video VAE post-quant projection");
+-    OP(h3_gpu_linear_f32(vae->gpu, vae->patch_hidden, vae->post, vae->embed_w,
++    OP(vae_linear(vae, vae->patch_hidden, vae->post, vae->embed_w,
+         vae->embed_b, vae->patches, LATENT_CHANNELS, HIDDEN),
+        "video VAE latent embedding");
+-    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden, 0, vae->patch_hidden, 0,
++    OP(vae_copy(vae, vae->hidden, 0, vae->patch_hidden, 0,
+         (size_t)vae->patches * HIDDEN), "pack video VAE patches");
+-    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden,
++    OP(vae_copy(vae, vae->hidden,
+         (size_t)vae->patches * HIDDEN, vae->registers, 0,
+         REGISTERS * HIDDEN), "pack video VAE registers");
+-    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden,
++    OP(vae_copy(vae, vae->hidden,
+         (size_t)(vae->patches + REGISTERS) * HIDDEN, zero, 0, HIDDEN),
+        "pack video VAE suffix");
+     OP(h3_gpu_submit(vae->gpu), "submit video VAE input projection");
+@@ -502,10 +658,10 @@ static int run_decoder(vae_context *vae, h3_video_vae_progress progress,
+     }
+     if (!load_output_weights(vae, error, error_size)) return 0;
+     OP(h3_gpu_begin(vae->gpu), "begin video VAE output projection");
+-    OP(h3_gpu_layer_norm_f32(vae->gpu, vae->norm, vae->hidden,
++    OP(vae_layer_norm(vae, vae->norm, vae->hidden,
+         vae->norm_out_w, vae->norm_out_b, vae->sequence, HIDDEN, 1e-5f),
+        "video VAE output LayerNorm");
+-    OP(h3_gpu_linear_f32(vae->gpu, vae->projected, vae->norm, vae->proj_w,
++    OP(vae_linear(vae, vae->projected, vae->norm, vae->proj_w,
+         vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
+        "video VAE output projection");
+     OP(h3_gpu_submit(vae->gpu), "submit video VAE decoder");
+@@ -532,9 +688,7 @@ static int load_resident_weights(vae_context *vae,
+  * per spatial tile, and permits one command-buffer chain per tile. */
+ static int run_resident_tile(vae_context *vae, char *error,
+                              size_t error_size) {
+-    float zeros[HIDDEN];
+-    memset(zeros, 0, sizeof(zeros));
+-    h3_gpu_tensor *zero = h3_gpu_tensor_from_f32(vae->gpu, zeros, HIDDEN);
++    h3_gpu_tensor *zero = make_zero(vae, HIDDEN);
+     if (!zero) {
+         fail(error, error_size, "cannot allocate video VAE suffix token");
+         return 0;
+@@ -545,18 +699,23 @@ static int run_resident_tile(vae_context *vae, char *error,
+     }                                                                           \
+ } while (0)
+     OP(h3_gpu_begin(vae->gpu), "begin tiled video VAE decoder");
+-    OP(h3_gpu_linear_f32(vae->gpu, vae->post, vae->latent, vae->post_w,
++    if (vae->bf16)
++        OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->latent_bf16, vae->latent,
++                                   vae->patches * LATENT_CHANNELS),
++           "cast tiled video VAE latent to BF16");
++    const h3_gpu_tensor *latent = vae->bf16 ? vae->latent_bf16 : vae->latent;
++    OP(vae_linear(vae, vae->post, latent, vae->post_w,
+         vae->post_b, vae->patches, LATENT_CHANNELS, LATENT_CHANNELS),
+        "tiled video VAE post-quant projection");
+-    OP(h3_gpu_linear_f32(vae->gpu, vae->patch_hidden, vae->post, vae->embed_w,
++    OP(vae_linear(vae, vae->patch_hidden, vae->post, vae->embed_w,
+         vae->embed_b, vae->patches, LATENT_CHANNELS, HIDDEN),
+        "tiled video VAE latent embedding");
+-    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden, 0, vae->patch_hidden, 0,
++    OP(vae_copy(vae, vae->hidden, 0, vae->patch_hidden, 0,
+         (size_t)vae->patches * HIDDEN), "pack tiled video VAE patches");
+-    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden,
++    OP(vae_copy(vae, vae->hidden,
+         (size_t)vae->patches * HIDDEN, vae->registers, 0,
+         REGISTERS * HIDDEN), "pack tiled video VAE registers");
+-    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden,
++    OP(vae_copy(vae, vae->hidden,
+         (size_t)(vae->patches + REGISTERS) * HIDDEN, zero, 0, HIDDEN),
+        "pack tiled video VAE suffix");
+     for (int index = 0; index < LAYERS; index++)
+@@ -564,10 +723,10 @@ static int run_resident_tile(vae_context *vae, char *error,
+             h3_gpu_tensor_free(zero);
+             return 0;
+         }
+-    OP(h3_gpu_layer_norm_f32(vae->gpu, vae->norm, vae->hidden,
++    OP(vae_layer_norm(vae, vae->norm, vae->hidden,
+         vae->norm_out_w, vae->norm_out_b, vae->sequence, HIDDEN, 1e-5f),
+        "tiled video VAE output LayerNorm");
+-    OP(h3_gpu_linear_f32(vae->gpu, vae->projected, vae->norm, vae->proj_w,
++    OP(vae_linear(vae, vae->projected, vae->norm, vae->proj_w,
+         vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
+        "tiled video VAE output projection");
+     OP(h3_gpu_submit(vae->gpu), "submit tiled video VAE decoder");
+@@ -576,6 +735,22 @@ static int run_resident_tile(vae_context *vae, char *error,
+     return 1;
+ }
+ 
++/* The projected patches keep the precision of the decoder that produced them.
++ * Always read them with the matching reader so the host never interprets a
++ * BF16 buffer as float32. */
++static int read_projected(vae_context *vae, float *rows, size_t count) {
++    if (!vae->bf16)
++        return h3_gpu_tensor_read_f32(vae->projected, rows, count);
++    uint16_t *packed = malloc(count * sizeof(*packed));
++    if (!packed) return 0;
++    int ok = h3_gpu_tensor_read_bf16(vae->projected, packed, count);
++    if (ok)
++        for (size_t index = 0; index < count; index++)
++            rows[index] = h3_bf16_to_float(packed[index]);
++    free(packed);
++    return ok;
++}
++
+ static int unpack_frame_range(vae_context *vae, int first_frame,
+                               int frame_count, h3_video_frames *output,
+                               char *error, size_t error_size) {
+@@ -596,7 +771,7 @@ static int unpack_frame_range(vae_context *vae, int first_frame,
+         fail(error, error_size, "out of memory unpacking video VAE frames");
+         return 0;
+     }
+-    if (!h3_gpu_tensor_read_f32(vae->projected, rows, projected_count)) {
++    if (!read_projected(vae, rows, projected_count)) {
+         free(rows); free(rgb);
+         fail(error, error_size, "cannot read video VAE output patches");
+         return 0;
+@@ -663,7 +838,14 @@ static int tile_count_for_extent(int extent, int tile_pixels) {
+     return count;
+ }
+ 
++/* The released checkpoint trains the decoder on 256-pixel spatial tiles, and
++ * the RoPE table is derived from the tile's own latent size (see
++ * prepare_rope()). A different tile size therefore decodes a function the
++ * model never saw, so the default stays at the checkpoint's 256 pixels and
++ * only H3_VAE_TILE_PIXELS may override it for experiments. */
+ static int configured_tile_pixels(int pixel_height, int pixel_width) {
++    (void)pixel_height;
++    (void)pixel_width;
+     const char *value = getenv("H3_VAE_TILE_PIXELS");
+     if (value && *value) {
+         char *end = NULL;
+@@ -671,22 +853,7 @@ static int configured_tile_pixels(int pixel_height, int pixel_width) {
+         if (end && !*end && pixels >= TILE_PIXELS && pixels <= 512 &&
+             pixels % SPATIAL_RATIO == 0) return (int)pixels;
+     }
+-    int best = TILE_PIXELS;
+-    uint64_t best_score = UINT64_MAX;
+-    for (int pixels = TILE_PIXELS; pixels <= 320;
+-         pixels += SPATIAL_RATIO) {
+-        uint64_t tiles = (uint64_t)tile_count_for_extent(pixel_height, pixels) *
+-            (uint64_t)tile_count_for_extent(pixel_width, pixels);
+-        /* The resident VAE is dominated by linears and activation traffic;
+-         * measured tile cost follows area more closely than cubic sequence
+-         * growth at these shapes. Attention is still included in each tile. */
+-        uint64_t score = tiles * (uint64_t)pixels * (uint64_t)pixels;
+-        if (score < best_score) {
+-            best = pixels;
+-            best_score = score;
+-        }
+-    }
+-    return best;
++    return TILE_PIXELS;
+ }
+ 
+ static int tile_axis_build(int extent, int tile_pixels, tile_axis *axis,
+@@ -923,6 +1090,7 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
+         fprintf(stderr, "h3: resident video VAE tiles %dx%d at %d pixels\n",
+                 decoder->x_axis.count, decoder->y_axis.count, tile_pixels);
+     vae_context *vae = &decoder->vae;
++    vae->bf16 = vae_prefers_bf16();
+     if (ok) {
+         vae->latent_h = decoder->y_axis.length / SPATIAL_RATIO;
+         vae->latent_w = decoder->x_axis.length / SPATIAL_RATIO;
+@@ -1071,6 +1239,7 @@ static int decode_chunked(const char *weight_directory,
+                 x_axis.count, y_axis.count, tile_pixels);
+     vae_context vae;
+     memset(&vae, 0, sizeof(vae));
++    vae.bf16 = vae_prefers_bf16();
+     vae.latent_h = y_axis.length / SPATIAL_RATIO;
+     vae.latent_w = x_axis.length / SPATIAL_RATIO;
+     vae.latent_t = CHUNK_LATENT_TIME;
+@@ -1204,6 +1373,7 @@ int h3_video_vae_decode(const char *weight_directory,
+     }
+     vae_context vae;
+     memset(&vae, 0, sizeof(vae));
++    vae.bf16 = vae_prefers_bf16();
+     vae.latent_h = latent_height;
+     vae.latent_w = latent_width;
+     vae.latent_t = latent_time;
+diff --git a/h3_weights.c b/h3_weights.c
+index 9a0224d..525d586 100644
+--- a/h3_weights.c
++++ b/h3_weights.c
+@@ -200,3 +200,77 @@ h3_gpu_tensor *h3_weight_load_f32(const h3_weight_store *store, h3_gpu *gpu,
+     return load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_F32,
+                        error, error_size);
+ }
++
++h3_gpu_tensor *h3_weight_load_f32_as_bf16(const h3_weight_store *store,
++                                           h3_gpu *gpu, const char *name,
++                                           int ndim, const uint64_t *shape,
++                                           char *error, size_t error_size) {
++    const h3_st_header *header = NULL;
++    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
++    if (!tensor) {
++        fail(error, error_size, "required weight is absent: %s", name);
++        return NULL;
++    }
++    if (tensor->ndim != ndim) {
++        fail(error, error_size, "weight %s has rank %d, expected %d",
++             name, tensor->ndim, ndim);
++        return NULL;
++    }
++    if (tensor->dtype != H3_DTYPE_F32 && tensor->dtype != H3_DTYPE_BF16) {
++        fail(error, error_size, "weight %s has dtype %s, expected F32 or BF16",
++             name, h3_dtype_name(tensor->dtype));
++        return NULL;
++    }
++    uint64_t elements = 1;
++    for (int dimension = 0; dimension < ndim; dimension++) {
++        if (tensor->shape[dimension] != shape[dimension]) {
++            fail(error, error_size, "weight %s shape mismatch at dimension %d",
++                 name, dimension);
++            return NULL;
++        }
++        if (shape[dimension] && elements > UINT64_MAX / shape[dimension]) {
++            fail(error, error_size, "weight %s shape overflows", name);
++            return NULL;
++        }
++        elements *= shape[dimension];
++    }
++    if (elements > SIZE_MAX) {
++        fail(error, error_size, "weight %s is too large for this process", name);
++        return NULL;
++    }
++    size_t count = (size_t)elements;
++    if (tensor->dtype == H3_DTYPE_BF16) {
++        h3_gpu_tensor *result = h3_gpu_tensor_load_bf16(gpu, header->path,
++                                                         tensor->file_offset,
++                                                         count);
++        if (!result)
++            fail(error, error_size, "cannot load %s: %s", name,
++                 h3_gpu_error(gpu));
++        return result;
++    }
++    if (count > SIZE_MAX / sizeof(float) || count > SIZE_MAX / sizeof(uint16_t)) {
++        fail(error, error_size, "weight %s is too large for this process", name);
++        return NULL;
++    }
++    float *values = malloc(count * sizeof(*values));
++    uint16_t *packed = malloc(count * sizeof(*packed));
++    if (!values || !packed) {
++        free(values); free(packed);
++        fail(error, error_size, "out of memory converting %s to BF16", name);
++        return NULL;
++    }
++    if (!h3_st_read_data(header, tensor, values, count * sizeof(*values),
++                         error, error_size)) {
++        free(values); free(packed);
++        return NULL;
++    }
++    for (size_t index = 0; index < count; index++)
++        packed[index] = h3_float_to_bf16(values[index]);
++    free(values);
++    h3_gpu_tensor *result = h3_gpu_tensor_from_bf16(gpu, packed, count);
++    free(packed);
++    if (!result)
++        fail(error, error_size, "cannot upload %s as BF16: %s", name,
++             h3_gpu_error(gpu));
++    return result;
++}
+diff --git a/h3_weights.h b/h3_weights.h
+index 89fbecc..7c241c1 100644
+--- a/h3_weights.h
++++ b/h3_weights.h
+@@ -6,9 +6,27 @@
+ 
+ #include <stddef.h>
+ #include <stdint.h>
++#include <string.h>
+ 
+ typedef struct h3_weight_store h3_weight_store;
+ 
++/* Round-to-nearest-even F32 -> BF16 bit pattern. This matches the packing
++ * used by the released BF16 checkpoints and by the native Metal kernels, so
++ * host-side conversions and checkpoint payloads agree bit for bit. */
++static inline uint16_t h3_float_to_bf16(float value) {
++    uint32_t bits;
++    memcpy(&bits, &value, sizeof(bits));
++    bits += 0x7fffu + ((bits >> 16) & 1u);
++    return (uint16_t)(bits >> 16);
++}
++
++static inline float h3_bf16_to_float(uint16_t value) {
++    uint32_t bits = (uint32_t)value << 16;
++    float result;
++    memcpy(&result, &bits, sizeof(result));
++    return result;
++}
++
+ /* Open every safetensors header in a component directory without reading
+  * tensor payloads. */
+ h3_weight_store *h3_weight_store_open(const char *directory,
+@@ -31,4 +49,13 @@ h3_gpu_tensor *h3_weight_load_f32(const h3_weight_store *store, h3_gpu *gpu,
+                                   const uint64_t *shape,
+                                   char *error, size_t error_size);
+ 
++/* Validate an exact shape and upload the tensor as BF16. Payloads stored as
++ * F32 (as the released video VAE checkpoint does) are converted on the host
++ * with round-to-nearest-even before the upload; payloads that are already
++ * BF16 are streamed straight into the Metal buffer. */
++h3_gpu_tensor *h3_weight_load_f32_as_bf16(const h3_weight_store *store,
++                                           h3_gpu *gpu, const char *name,
++                                           int ndim, const uint64_t *shape,
++                                           char *error, size_t error_size);
++
+ #endif
+diff --git a/tests/test_gpu_bf16_ops.c b/tests/test_gpu_bf16_ops.c
+new file mode 100644
+index 0000000..8dffd8b
+--- /dev/null
++++ b/tests/test_gpu_bf16_ops.c
+@@ -0,0 +1,784 @@
++/* Numerical agreement between the BF16 video-VAE primitives and their F32
++ * counterparts.
++ *
++ * The BF16 kernels are a transcription of the F32 ones, so the only tolerated
++ * difference is the BF16 quantization of the tensors that cross the GPU
++ * boundary. Three protocols are used:
++ *
++ *   A. accuracy   - the F32 path consumes the reference floats while the BF16
++ *                   path consumes their BF16 truncation. This is what the VAE
++ *                   decoder actually pays, and it is reported as relative L2
++ *                   error plus the largest absolute deviation.
++ *   B. structural - both paths consume numerically identical values (the F32
++ *                   path receives the BF16 truncation widened back to F32).
++ *                   Every intermediate is then bit-identical, so the BF16
++ *                   output must equal the BF16 rounding of the F32 output
++ *                   exactly. This is the check that catches a mis-copied RoPE
++ *                   sign, a wrong cosine/sine index or a misplaced epsilon.
++ *   C. reference  - an independent host implementation in double precision is
++ *                   compared against both GPU paths.
++ *
++ * The RoPE half-split rotation is additionally verified analytically: the
++ * cosine and sine actually applied by the kernel are recovered from the
++ * output pair and compared against the cosine/sine table.
++ */
++#include "h3_gpu.h"
++
++#include <math.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++enum {
++    /* Match the released video VAE decoder geometry. */
++    ROWS = 3,
++    WIDTH = 2048,
++    HEADS = 32,
++    HEAD_DIM = 64,
++    ROPE_HALF = 24,
++    INNER = HEADS * HEAD_DIM,
++    COUNT = ROWS * INNER,
++    QKV_COUNT = COUNT * 3,
++    ROPE_COUNT = ROWS * ROPE_HALF,
++    MAX_TENSORS = 64
++};
++
++typedef struct {
++    h3_gpu *gpu;
++    h3_gpu_tensor *owned[MAX_TENSORS];
++    size_t owned_count;
++} gpu_test;
++
++typedef struct {
++    double rel_l2;
++    double max_abs;
++    size_t mismatches;
++} comparison;
++
++static void fail(const char *message) {
++    fprintf(stderr, "FAIL tests/test_gpu_bf16_ops.c: %s\n", message);
++    exit(1);
++}
++
++static void require(int condition, const char *message) {
++    if (!condition) fail(message);
++}
++
++static void require_gpu(gpu_test *test, int condition,
++                        const char *operation) {
++    if (condition) return;
++    fprintf(stderr, "FAIL tests/test_gpu_bf16_ops.c: %s: %s\n", operation,
++            h3_gpu_error(test->gpu));
++    exit(1);
++}
++
++static h3_gpu_tensor *own(gpu_test *test, h3_gpu_tensor *tensor) {
++    require(tensor != NULL, "Metal tensor allocation failed");
++    require(test->owned_count < MAX_TENSORS, "tensor registry is full");
++    test->owned[test->owned_count++] = tensor;
++    return tensor;
++}
++
++static void release(gpu_test *test) {
++    while (test->owned_count)
++        h3_gpu_tensor_free(test->owned[--test->owned_count]);
++}
++
++/* BF16 conversion must mirror h3_shaders.metal exactly: round to nearest,
++ * ties to even, and an exact widening on the way back. */
++static uint16_t f32_to_bf16(float value) {
++    uint32_t bits;
++    memcpy(&bits, &value, sizeof(bits));
++    bits += 0x7fffu + ((bits >> 16) & 1u);
++    return (uint16_t)(bits >> 16);
++}
++
++static float bf16_to_f32(uint16_t value) {
++    uint32_t bits = (uint32_t)value << 16;
++    float result;
++    memcpy(&result, &bits, sizeof(result));
++    return result;
++}
++
++/* Spacing of the BF16 grid at the given magnitude, used to tell a rounding
++ * difference apart from a genuine disagreement. */
++static double bf16_spacing(float value) {
++    double magnitude = fabs((double)value);
++    int exponent = 0;
++    if (magnitude == 0.0) return 0.0;
++    frexp(magnitude, &exponent);
++    return ldexp(1.0, exponent - 8);
++}
++
++static uint32_t random_state = 0x9e3779b9u;
++
++static float random_value(void) {
++    random_state = random_state * 1664525u + 1013904223u;
++    uint32_t bits = random_state >> 8;
++    float unit = (float)bits * (1.0f / 16777216.0f);
++    return unit * 2.0f - 1.0f;
++}
++
++/* Relative L2 error, largest absolute deviation and the number of elements
++ * that sit more than one BF16 step away from the reference. */
++static comparison compare(const float *reference, const float *candidate,
++                          size_t count) {
++    comparison result = {0.0, 0.0, 0};
++    double reference_norm = 0.0;
++    double difference_norm = 0.0;
++    for (size_t i = 0; i < count; i++) {
++        double reference_value = (double)reference[i];
++        double difference = (double)candidate[i] - reference_value;
++        reference_norm += reference_value * reference_value;
++        difference_norm += difference * difference;
++        double magnitude = fabs(difference);
++        if (magnitude > result.max_abs) result.max_abs = magnitude;
++        if (magnitude > bf16_spacing(reference[i])) result.mismatches++;
++    }
++    if (reference_norm > 0.0)
++        result.rel_l2 = sqrt(difference_norm / reference_norm);
++    return result;
++}
++
++/* Independent host implementation of the video QKV kernel, in double
++ * precision. It follows h3_video_qkv_rope_f32: a QK RMS norm over the whole
++ * head with the epsilon inside the square root, then a half-split rotation
++ * whose second half reuses the cosine/sine of the first half with the sine
++ * term added instead of subtracted. */
++static void reference_qkv_rope(const float *qkv, const float *rope_cos,
++                                const float *rope_sin, float *query,
++                                float *key, float *value, uint32_t sequence,
++                                uint32_t heads, uint32_t head_dim,
++                                uint32_t rope_half, double epsilon) {
++    for (uint32_t row = 0; row < sequence; row++) {
++        for (uint32_t head = 0; head < heads; head++) {
++            size_t base = ((size_t)row * heads + head) * head_dim * 3;
++            double q_sum = 0.0;
++            double k_sum = 0.0;
++            for (uint32_t d = 0; d < head_dim; d++) {
++                double q = (double)qkv[base + d];
++                double k = (double)qkv[base + head_dim + d];
++                q_sum += q * q;
++                k_sum += k * k;
++            }
++            double q_inverse = 1.0 / sqrt(q_sum / (double)head_dim + epsilon);
++            double k_inverse = 1.0 / sqrt(k_sum / (double)head_dim + epsilon);
++            for (uint32_t dimension = 0; dimension < head_dim; dimension++) {
++                double q0 = (double)qkv[base + dimension] * q_inverse;
++                double k0 = (double)qkv[base + head_dim + dimension] *
++                            k_inverse;
++                if (dimension < rope_half) {
++                    uint32_t pair = dimension + rope_half;
++                    double q1 = (double)qkv[base + pair] * q_inverse;
++                    double k1 = (double)qkv[base + head_dim + pair] *
++                                k_inverse;
++                    double cosine = (double)rope_cos[
++                        (size_t)row * rope_half + dimension];
++                    double sine = (double)rope_sin[
++                        (size_t)row * rope_half + dimension];
++                    q0 = q0 * cosine - q1 * sine;
++                    k0 = k0 * cosine - k1 * sine;
++                } else if (dimension < rope_half * 2) {
++                    uint32_t pair = dimension - rope_half;
++                    double q1 = (double)qkv[base + pair] * q_inverse;
++                    double k1 = (double)qkv[base + head_dim + pair] *
++                                k_inverse;
++                    double cosine = (double)rope_cos[
++                        (size_t)row * rope_half + pair];
++                    double sine = (double)rope_sin[
++                        (size_t)row * rope_half + pair];
++                    q0 = q0 * cosine + q1 * sine;
++                    k0 = k0 * cosine + k1 * sine;
++                }
++                size_t output = ((size_t)row * heads + head) * head_dim +
++                                dimension;
++                query[output] = (float)q0;
++                key[output] = (float)k0;
++                value[output] = qkv[base + (size_t)head_dim * 2 + dimension];
++            }
++        }
++    }
++}
++
++/* Recover the cosine and sine that the kernel applied to one half-split
++ * pair. For a rotation by an angle t the pair (x0, x1) maps to
++ * (x0*c - x1*s, x1*c + x0*s), so the dot and cross products against the
++ * input recover c and s exactly. This validates the rotation direction, the
++ * sign convention and the cosine/sine index without restating the kernel.
++ *
++ * The tolerance accounts for the precision of the output being inspected: an
++ * F32 output recovers the coefficients to full precision, a BF16 output only
++ * to the BF16 grid. A wrong sign or a wrong index shifts the recovered
++ * coefficient by an order of magnitude, far outside both tolerances. */
++static void check_rope_rotation(const char *label, const float *qkv,
++                                const float *query, const float *rope_cos,
++                                const float *rope_sin, uint32_t sequence,
++                                uint32_t heads, uint32_t head_dim,
++                                uint32_t rope_half, double epsilon,
++                                double tolerance) {
++    double worst_cosine = 0.0;
++    double worst_sine = 0.0;
++    for (uint32_t row = 0; row < sequence; row++) {
++        for (uint32_t head = 0; head < heads; head++) {
++            size_t base = ((size_t)row * heads + head) * head_dim * 3;
++            size_t output_base = ((size_t)row * heads + head) * head_dim;
++            double q_sum = 0.0;
++            for (uint32_t d = 0; d < head_dim; d++) {
++                double q = (double)qkv[base + d];
++                q_sum += q * q;
++            }
++            double q_inverse = 1.0 / sqrt(q_sum / (double)head_dim + epsilon);
++            for (uint32_t d = 0; d < rope_half; d++) {
++                double x0 = (double)qkv[base + d] * q_inverse;
++                double x1 = (double)qkv[base + d + rope_half] * q_inverse;
++                double o0 = (double)query[output_base + d];
++                double o1 = (double)query[output_base + d + rope_half];
++                double norm = x0 * x0 + x1 * x1;
++                if (norm < 1e-12) continue;
++                double cosine = (x0 * o0 + x1 * o1) / norm;
++                double sine = (x0 * o1 - x1 * o0) / norm;
++                double expected_cosine = (double)rope_cos[
++                    (size_t)row * rope_half + d];
++                double expected_sine = (double)rope_sin[
++                    (size_t)row * rope_half + d];
++                double cosine_error = fabs(cosine - expected_cosine);
++                double sine_error = fabs(sine - expected_sine);
++                if (cosine_error > worst_cosine)
++                    worst_cosine = cosine_error;
++                if (sine_error > worst_sine) worst_sine = sine_error;
++            }
++        }
++    }
++    printf("  rope rotation (%s): worst |cos| error %.3g, worst |sin| error "
++           "%.3g\n", label, worst_cosine, worst_sine);
++    require(worst_cosine < tolerance,
++            "RoPE cosine does not match the table");
++    require(worst_sine < tolerance, "RoPE sine does not match the table");
++}
++
++/* The RMS inverse must be rsqrt(sum / head_dim + epsilon) over the whole
++ * head, epsilon included inside the square root. Dimensions beyond the
++ * rotated range keep the plain normalized value, so they expose the scale
++ * factor directly. */
++static void check_rms_inverse(const float *qkv, const float *query,
++                              uint32_t sequence, uint32_t heads,
++                              uint32_t head_dim, uint32_t rope_half,
++                              double epsilon) {
++    double worst = 0.0;
++    for (uint32_t row = 0; row < sequence; row++) {
++        for (uint32_t head = 0; head < heads; head++) {
++            size_t base = ((size_t)row * heads + head) * head_dim * 3;
++            size_t output_base = ((size_t)row * heads + head) * head_dim;
++            double q_sum = 0.0;
++            for (uint32_t d = 0; d < head_dim; d++) {
++                double q = (double)qkv[base + d];
++                q_sum += q * q;
++            }
++            double expected = 1.0 / sqrt(q_sum / (double)head_dim + epsilon);
++            for (uint32_t d = rope_half * 2; d < head_dim; d++) {
++                double source = (double)qkv[base + d];
++                if (fabs(source) < 1e-6) continue;
++                double actual = (double)query[output_base + d] / source;
++                double error = fabs(actual - expected) / expected;
++                if (error > worst) worst = error;
++            }
++        }
++    }
++    printf("  rms inverse: worst relative error %.3g\n", worst);
++    require(worst < 1e-3, "QK RMS inverse disagrees with the reference");
++}
++
++static void test_scale_add(gpu_test *test) {
++    float *residual = malloc((size_t)ROWS * WIDTH * sizeof(float));
++    float *branch = malloc((size_t)ROWS * WIDTH * sizeof(float));
++    float *scale = malloc((size_t)WIDTH * sizeof(float));
++    float *reference = malloc((size_t)ROWS * WIDTH * sizeof(float));
++    uint16_t *residual_bf16 = malloc((size_t)ROWS * WIDTH * sizeof(uint16_t));
++    uint16_t *branch_bf16 = malloc((size_t)ROWS * WIDTH * sizeof(uint16_t));
++    uint16_t *scale_bf16 = malloc((size_t)WIDTH * sizeof(uint16_t));
++    float *candidate = malloc((size_t)ROWS * WIDTH * sizeof(float));
++    require(residual && branch && scale && reference && residual_bf16 &&
++            branch_bf16 && scale_bf16 && candidate, "host allocation failed");
++    for (size_t i = 0; i < (size_t)ROWS * WIDTH; i++) {
++        residual[i] = random_value();
++        branch[i] = random_value();
++        residual_bf16[i] = f32_to_bf16(residual[i]);
++        branch_bf16[i] = f32_to_bf16(branch[i]);
++    }
++    for (size_t i = 0; i < WIDTH; i++) {
++        scale[i] = random_value();
++        scale_bf16[i] = f32_to_bf16(scale[i]);
++    }
++
++    h3_gpu_tensor *f32_residual = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, residual, (size_t)ROWS * WIDTH));
++    h3_gpu_tensor *f32_branch = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, branch, (size_t)ROWS * WIDTH));
++    h3_gpu_tensor *f32_scale = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, scale, WIDTH));
++    h3_gpu_tensor *f32_output = own(test, h3_gpu_tensor_new_f32(
++        test->gpu, (size_t)ROWS * WIDTH));
++    h3_gpu_tensor *bf16_residual = own(test, h3_gpu_tensor_from_bf16(
++        test->gpu, residual_bf16, (size_t)ROWS * WIDTH));
++    h3_gpu_tensor *bf16_branch = own(test, h3_gpu_tensor_from_bf16(
++        test->gpu, branch_bf16, (size_t)ROWS * WIDTH));
++    h3_gpu_tensor *bf16_scale = own(test, h3_gpu_tensor_from_bf16(
++        test->gpu, scale_bf16, WIDTH));
++    h3_gpu_tensor *bf16_output = own(test, h3_gpu_tensor_new_bf16(
++        test->gpu, (size_t)ROWS * WIDTH));
++
++    require_gpu(test, h3_gpu_begin(test->gpu),
++                "begin scale-add command stream");
++    require_gpu(test, h3_gpu_scale_add_f32(test->gpu, f32_output, f32_residual,
++               f32_branch, f32_scale, ROWS, WIDTH),
++               "encode F32 scale-add");
++    require_gpu(test, h3_gpu_scale_add_bf16(test->gpu, bf16_output,
++               bf16_residual, bf16_branch, bf16_scale, ROWS, WIDTH),
++               "encode BF16 scale-add");
++    require_gpu(test, h3_gpu_submit(test->gpu),
++                "submit scale-add command stream");
++
++    require(h3_gpu_tensor_read_f32(f32_output, reference,
++                                   (size_t)ROWS * WIDTH),
++            "cannot read F32 scale-add output");
++    uint16_t *bf16_result = malloc((size_t)ROWS * WIDTH * sizeof(uint16_t));
++    require(bf16_result != NULL, "host allocation failed");
++    require(h3_gpu_tensor_read_bf16(bf16_output, bf16_result,
++                                    (size_t)ROWS * WIDTH),
++            "cannot read BF16 scale-add output");
++    for (size_t i = 0; i < (size_t)ROWS * WIDTH; i++)
++        candidate[i] = bf16_to_f32(bf16_result[i]);
++
++    comparison accuracy = compare(reference, candidate,
++                                   (size_t)ROWS * WIDTH);
++    printf("scale-add (BF16 input vs F32 reference): rel-L2 %.4g, "
++           "max |delta| %.4g, mismatches %zu/%d\n",
++           accuracy.rel_l2, accuracy.max_abs, accuracy.mismatches,
++           ROWS * WIDTH);
++    require(accuracy.rel_l2 < 1e-2, "scale-add relative L2 exceeds 1e-2");
++
++    /* Protocol B: feed the F32 path the same values the BF16 path sees. */
++    float *widened_residual = malloc((size_t)ROWS * WIDTH * sizeof(float));
++    float *widened_branch = malloc((size_t)ROWS * WIDTH * sizeof(float));
++    float *widened_scale = malloc((size_t)WIDTH * sizeof(float));
++    require(widened_residual && widened_branch && widened_scale,
++            "host allocation failed");
++    for (size_t i = 0; i < (size_t)ROWS * WIDTH; i++) {
++        widened_residual[i] = bf16_to_f32(residual_bf16[i]);
++        widened_branch[i] = bf16_to_f32(branch_bf16[i]);
++    }
++    for (size_t i = 0; i < WIDTH; i++)
++        widened_scale[i] = bf16_to_f32(scale_bf16[i]);
++
++    h3_gpu_tensor *wide_residual = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, widened_residual, (size_t)ROWS * WIDTH));
++    h3_gpu_tensor *wide_branch = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, widened_branch, (size_t)ROWS * WIDTH));
++    h3_gpu_tensor *wide_scale = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, widened_scale, WIDTH));
++    h3_gpu_tensor *wide_output = own(test, h3_gpu_tensor_new_f32(
++        test->gpu, (size_t)ROWS * WIDTH));
++    require_gpu(test, h3_gpu_begin(test->gpu),
++                "begin scale-add identity command stream");
++    require_gpu(test, h3_gpu_scale_add_f32(test->gpu, wide_output,
++               wide_residual, wide_branch, wide_scale, ROWS, WIDTH),
++               "encode F32 scale-add with identical values");
++    require_gpu(test, h3_gpu_submit(test->gpu),
++                "submit scale-add identity command stream");
++    require(h3_gpu_tensor_read_f32(wide_output, reference,
++                                   (size_t)ROWS * WIDTH),
++            "cannot read F32 scale-add identity output");
++
++    size_t exact = 0;
++    for (size_t i = 0; i < (size_t)ROWS * WIDTH; i++) {
++        if (f32_to_bf16(reference[i]) == bf16_result[i]) exact++;
++    }
++    printf("scale-add (identical values): %zu/%d bit-exact against the F32 "
++           "path\n", exact, ROWS * WIDTH);
++    require(exact == (size_t)ROWS * WIDTH,
++            "scale-add BF16 output is not the BF16 rounding of the F32 output");
++
++    free(residual); free(branch); free(scale); free(reference);
++    free(residual_bf16); free(branch_bf16); free(scale_bf16);
++    free(candidate); free(bf16_result);
++    free(widened_residual); free(widened_branch); free(widened_scale);
++}
++
++static void test_qkv_rope(gpu_test *test) {
++    const float epsilon = 1e-5f;
++    float *qkv = malloc((size_t)QKV_COUNT * sizeof(float));
++    float *rope_cos = malloc((size_t)ROPE_COUNT * sizeof(float));
++    float *rope_sin = malloc((size_t)ROPE_COUNT * sizeof(float));
++    uint16_t *qkv_bf16 = malloc((size_t)QKV_COUNT * sizeof(uint16_t));
++    uint16_t *rope_cos_bf16 = malloc((size_t)ROPE_COUNT * sizeof(uint16_t));
++    uint16_t *rope_sin_bf16 = malloc((size_t)ROPE_COUNT * sizeof(uint16_t));
++    float *reference_query = malloc((size_t)COUNT * sizeof(float));
++    float *reference_key = malloc((size_t)COUNT * sizeof(float));
++    float *reference_value = malloc((size_t)COUNT * sizeof(float));
++    float *candidate_query = malloc((size_t)COUNT * sizeof(float));
++    float *candidate_key = malloc((size_t)COUNT * sizeof(float));
++    float *candidate_value = malloc((size_t)COUNT * sizeof(float));
++    require(qkv && rope_cos && rope_sin && qkv_bf16 && rope_cos_bf16 &&
++            rope_sin_bf16 && reference_query && reference_key &&
++            reference_value && candidate_query && candidate_key &&
++            candidate_value, "host allocation failed");
++
++    for (size_t i = 0; i < (size_t)QKV_COUNT; i++) {
++        qkv[i] = random_value();
++        qkv_bf16[i] = f32_to_bf16(qkv[i]);
++    }
++    for (size_t i = 0; i < (size_t)ROPE_COUNT; i++) {
++        double angle = (double)random_value() * 3.14159265358979323846;
++        rope_cos[i] = (float)cos(angle);
++        rope_sin[i] = (float)sin(angle);
++        rope_cos_bf16[i] = f32_to_bf16(rope_cos[i]);
++        rope_sin_bf16[i] = f32_to_bf16(rope_sin[i]);
++    }
++
++    h3_gpu_tensor *f32_qkv = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, qkv, QKV_COUNT));
++    h3_gpu_tensor *f32_cos = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, rope_cos, ROPE_COUNT));
++    h3_gpu_tensor *f32_sin = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, rope_sin, ROPE_COUNT));
++    h3_gpu_tensor *f32_query = own(test, h3_gpu_tensor_new_f32(
++        test->gpu, COUNT));
++    h3_gpu_tensor *f32_key = own(test, h3_gpu_tensor_new_f32(test->gpu, COUNT));
++    h3_gpu_tensor *f32_value = own(test, h3_gpu_tensor_new_f32(test->gpu, COUNT));
++    h3_gpu_tensor *bf16_qkv = own(test, h3_gpu_tensor_from_bf16(
++        test->gpu, qkv_bf16, QKV_COUNT));
++    h3_gpu_tensor *bf16_cos = own(test, h3_gpu_tensor_from_bf16(
++        test->gpu, rope_cos_bf16, ROPE_COUNT));
++    h3_gpu_tensor *bf16_sin = own(test, h3_gpu_tensor_from_bf16(
++        test->gpu, rope_sin_bf16, ROPE_COUNT));
++    h3_gpu_tensor *bf16_query = own(test, h3_gpu_tensor_new_bf16(test->gpu, COUNT));
++    h3_gpu_tensor *bf16_key = own(test, h3_gpu_tensor_new_bf16(test->gpu, COUNT));
++    h3_gpu_tensor *bf16_value = own(test, h3_gpu_tensor_new_bf16(test->gpu, COUNT));
++
++    require_gpu(test, h3_gpu_begin(test->gpu),
++                "begin video QKV command stream");
++    require_gpu(test, h3_gpu_video_qkv_rope_f32(test->gpu, f32_query,
++               f32_key, f32_value, f32_qkv, f32_cos, f32_sin, ROWS, HEADS,
++               HEAD_DIM, ROPE_HALF, epsilon), "encode F32 video QKV");
++    require_gpu(test, h3_gpu_video_qkv_rope_bf16(test->gpu, bf16_query,
++               bf16_key, bf16_value, bf16_qkv, bf16_cos, bf16_sin, ROWS,
++               HEADS, HEAD_DIM, ROPE_HALF, epsilon), "encode BF16 video QKV");
++    require_gpu(test, h3_gpu_submit(test->gpu),
++                "submit video QKV command stream");
++
++    uint16_t *bf16_query_result = malloc((size_t)COUNT * sizeof(uint16_t));
++    uint16_t *bf16_key_result = malloc((size_t)COUNT * sizeof(uint16_t));
++    uint16_t *bf16_value_result = malloc((size_t)COUNT * sizeof(uint16_t));
++    require(bf16_query_result && bf16_key_result && bf16_value_result,
++            "host allocation failed");
++    require(h3_gpu_tensor_read_f32(f32_query, reference_query, COUNT),
++            "cannot read F32 query");
++    require(h3_gpu_tensor_read_f32(f32_key, reference_key, COUNT),
++            "cannot read F32 key");
++    require(h3_gpu_tensor_read_f32(f32_value, reference_value, COUNT),
++            "cannot read F32 value");
++    require(h3_gpu_tensor_read_bf16(bf16_query, bf16_query_result, COUNT),
++            "cannot read BF16 query");
++    require(h3_gpu_tensor_read_bf16(bf16_key, bf16_key_result, COUNT),
++            "cannot read BF16 key");
++    require(h3_gpu_tensor_read_bf16(bf16_value, bf16_value_result, COUNT),
++            "cannot read BF16 value");
++    for (size_t i = 0; i < COUNT; i++) {
++        candidate_query[i] = bf16_to_f32(bf16_query_result[i]);
++        candidate_key[i] = bf16_to_f32(bf16_key_result[i]);
++        candidate_value[i] = bf16_to_f32(bf16_value_result[i]);
++    }
++
++    comparison query_accuracy = compare(reference_query, candidate_query, COUNT);
++    comparison key_accuracy = compare(reference_key, candidate_key, COUNT);
++    printf("video qkv (BF16 input vs F32 reference): query rel-L2 %.4g, "
++           "max |delta| %.4g, mismatches %zu/%d\n",
++           query_accuracy.rel_l2, query_accuracy.max_abs,
++           query_accuracy.mismatches, COUNT);
++    printf("video qkv (BF16 input vs F32 reference): key   rel-L2 %.4g, "
++           "max |delta| %.4g, mismatches %zu/%d\n",
++           key_accuracy.rel_l2, key_accuracy.max_abs,
++           key_accuracy.mismatches, COUNT);
++    require(query_accuracy.rel_l2 < 1e-2, "query relative L2 exceeds 1e-2");
++    require(key_accuracy.rel_l2 < 1e-2, "key relative L2 exceeds 1e-2");
++
++    /* The value channel is a pure copy, so it must match the BF16 rounding
++     * of the F32 value exactly. */
++    size_t value_exact = 0;
++    for (size_t i = 0; i < COUNT; i++) {
++        if (f32_to_bf16(reference_value[i]) == bf16_value_result[i])
++            value_exact++;
++    }
++    printf("video qkv value channel: %zu/%d bit-exact against the F32 path\n",
++           value_exact, COUNT);
++    require(value_exact == COUNT,
++            "video qkv value channel is not a verbatim copy");
++
++    /* Protocol B: identical values on both paths. */
++    float *wide_qkv = malloc((size_t)QKV_COUNT * sizeof(float));
++    float *wide_cos = malloc((size_t)ROPE_COUNT * sizeof(float));
++    float *wide_sin = malloc((size_t)ROPE_COUNT * sizeof(float));
++    require(wide_qkv && wide_cos && wide_sin, "host allocation failed");
++    for (size_t i = 0; i < (size_t)QKV_COUNT; i++)
++        wide_qkv[i] = bf16_to_f32(qkv_bf16[i]);
++    for (size_t i = 0; i < (size_t)ROPE_COUNT; i++) {
++        wide_cos[i] = bf16_to_f32(rope_cos_bf16[i]);
++        wide_sin[i] = bf16_to_f32(rope_sin_bf16[i]);
++    }
++    h3_gpu_tensor *wide_qkv_tensor = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, wide_qkv, QKV_COUNT));
++    h3_gpu_tensor *wide_cos_tensor = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, wide_cos, ROPE_COUNT));
++    h3_gpu_tensor *wide_sin_tensor = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, wide_sin, ROPE_COUNT));
++    h3_gpu_tensor *wide_query = own(test, h3_gpu_tensor_new_f32(test->gpu, COUNT));
++    h3_gpu_tensor *wide_key = own(test, h3_gpu_tensor_new_f32(test->gpu, COUNT));
++    h3_gpu_tensor *wide_value = own(test, h3_gpu_tensor_new_f32(test->gpu, COUNT));
++    require_gpu(test, h3_gpu_begin(test->gpu),
++                "begin video QKV identity command stream");
++    require_gpu(test, h3_gpu_video_qkv_rope_f32(test->gpu, wide_query,
++               wide_key, wide_value, wide_qkv_tensor, wide_cos_tensor,
++               wide_sin_tensor, ROWS, HEADS, HEAD_DIM, ROPE_HALF, epsilon),
++               "encode F32 video QKV with identical values");
++    require_gpu(test, h3_gpu_submit(test->gpu),
++                "submit video QKV identity command stream");
++    require(h3_gpu_tensor_read_f32(wide_query, reference_query, COUNT),
++            "cannot read F32 identity query");
++    require(h3_gpu_tensor_read_f32(wide_key, reference_key, COUNT),
++            "cannot read F32 identity key");
++    require(h3_gpu_tensor_read_f32(wide_value, reference_value, COUNT),
++            "cannot read F32 identity value");
++
++    size_t query_exact = 0;
++    size_t key_exact = 0;
++    for (size_t i = 0; i < COUNT; i++) {
++        if (f32_to_bf16(reference_query[i]) == bf16_query_result[i])
++            query_exact++;
++        if (f32_to_bf16(reference_key[i]) == bf16_key_result[i]) key_exact++;
++    }
++    printf("video qkv (identical values): query %zu/%d bit-exact, key %zu/%d "
++           "bit-exact against the F32 path\n",
++           query_exact, COUNT, key_exact, COUNT);
++    require(query_exact == COUNT,
++            "BF16 query is not the BF16 rounding of the F32 query");
++    require(key_exact == COUNT,
++            "BF16 key is not the BF16 rounding of the F32 key");
++
++    /* Protocol C: the independent double precision reference. */
++    float *host_query = malloc((size_t)COUNT * sizeof(float));
++    float *host_key = malloc((size_t)COUNT * sizeof(float));
++    float *host_value = malloc((size_t)COUNT * sizeof(float));
++    require(host_query && host_key && host_value, "host allocation failed");
++    reference_qkv_rope(wide_qkv, wide_cos, wide_sin, host_query, host_key,
++                       host_value, ROWS, HEADS, HEAD_DIM, ROPE_HALF,
++                       (double)epsilon);
++    comparison host_query_error = compare(host_query, reference_query, COUNT);
++    comparison host_key_error = compare(host_key, reference_key, COUNT);
++    comparison host_value_error = compare(host_value, reference_value, COUNT);
++    printf("video qkv (host reference vs F32 path): query rel-L2 %.4g, "
++           "key rel-L2 %.4g, value rel-L2 %.4g\n",
++           host_query_error.rel_l2, host_key_error.rel_l2,
++           host_value_error.rel_l2);
++    require(host_query_error.rel_l2 < 1e-5,
++            "F32 query disagrees with the host reference");
++    require(host_key_error.rel_l2 < 1e-5,
++            "F32 key disagrees with the host reference");
++    require(host_value_error.max_abs == 0.0,
++            "F32 value is not a verbatim copy");
++
++    /* The BF16 path must also track the host reference. */
++    comparison bf16_query_error = compare(host_query, candidate_query, COUNT);
++    comparison bf16_key_error = compare(host_key, candidate_key, COUNT);
++    printf("video qkv (host reference vs BF16 path): query rel-L2 %.4g, "
++           "key rel-L2 %.4g\n",
++           bf16_query_error.rel_l2, bf16_key_error.rel_l2);
++    require(bf16_query_error.rel_l2 < 1e-2,
++            "BF16 query diverges from the host reference");
++    require(bf16_key_error.rel_l2 < 1e-2,
++            "BF16 key diverges from the host reference");
++
++    check_rope_rotation("F32 path", wide_qkv, reference_query, wide_cos,
++                        wide_sin, ROWS, HEADS, HEAD_DIM, ROPE_HALF,
++                        (double)epsilon, 1e-3);
++    /* The same probe on the BF16 output, whose precision only allows a
++     * looser bound. */
++    check_rope_rotation("BF16 path", wide_qkv, candidate_query, wide_cos,
++                        wide_sin, ROWS, HEADS, HEAD_DIM, ROPE_HALF,
++                        (double)epsilon, 1e-2);
++    check_rms_inverse(wide_qkv, reference_query, ROWS, HEADS, HEAD_DIM,
++                      ROPE_HALF, (double)epsilon);
++
++    free(qkv); free(rope_cos); free(rope_sin);
++    free(qkv_bf16); free(rope_cos_bf16); free(rope_sin_bf16);
++    free(reference_query); free(reference_key); free(reference_value);
++    free(candidate_query); free(candidate_key); free(candidate_value);
++    free(bf16_query_result); free(bf16_key_result); free(bf16_value_result);
++    free(wide_qkv); free(wide_cos); free(wide_sin);
++    free(host_query); free(host_key); free(host_value);
++}
++
++/* The epsilon of the QK RMS norm has to sit inside the square root, on the
++ * mean of the squares. With the production value of 1e-5 the effect is below
++ * the noise floor of the data, so the placement is probed with a large
++ * epsilon instead: a norm that ignores the epsilon, divides by
++ * (head_dim + epsilon) or adds the epsilon after the square root all give a
++ * visibly different scale factor. */
++static void test_epsilon_placement(gpu_test *test) {
++    const float epsilon = 1.0f;
++    float *qkv = malloc((size_t)QKV_COUNT * sizeof(float));
++    float *rope_cos = malloc((size_t)ROPE_COUNT * sizeof(float));
++    float *rope_sin = malloc((size_t)ROPE_COUNT * sizeof(float));
++    uint16_t *qkv_bf16 = malloc((size_t)QKV_COUNT * sizeof(uint16_t));
++    uint16_t *rope_cos_bf16 = malloc((size_t)ROPE_COUNT * sizeof(uint16_t));
++    uint16_t *rope_sin_bf16 = malloc((size_t)ROPE_COUNT * sizeof(uint16_t));
++    float *wide_qkv = malloc((size_t)QKV_COUNT * sizeof(float));
++    float *wide_cos = malloc((size_t)ROPE_COUNT * sizeof(float));
++    float *wide_sin = malloc((size_t)ROPE_COUNT * sizeof(float));
++    float *reference_query = malloc((size_t)COUNT * sizeof(float));
++    float *reference_key = malloc((size_t)COUNT * sizeof(float));
++    float *reference_value = malloc((size_t)COUNT * sizeof(float));
++    float *host_query = malloc((size_t)COUNT * sizeof(float));
++    float *host_key = malloc((size_t)COUNT * sizeof(float));
++    float *host_value = malloc((size_t)COUNT * sizeof(float));
++    require(qkv && rope_cos && rope_sin && qkv_bf16 && rope_cos_bf16 &&
++            rope_sin_bf16 && wide_qkv && wide_cos && wide_sin &&
++            reference_query && reference_key && reference_value &&
++            host_query && host_key && host_value, "host allocation failed");
++
++    for (size_t i = 0; i < (size_t)QKV_COUNT; i++) {
++        qkv[i] = random_value();
++        qkv_bf16[i] = f32_to_bf16(qkv[i]);
++        wide_qkv[i] = bf16_to_f32(qkv_bf16[i]);
++    }
++    for (size_t i = 0; i < (size_t)ROPE_COUNT; i++) {
++        double angle = (double)random_value() * 3.14159265358979323846;
++        rope_cos[i] = (float)cos(angle);
++        rope_sin[i] = (float)sin(angle);
++        rope_cos_bf16[i] = f32_to_bf16(rope_cos[i]);
++        rope_sin_bf16[i] = f32_to_bf16(rope_sin[i]);
++        wide_cos[i] = bf16_to_f32(rope_cos_bf16[i]);
++        wide_sin[i] = bf16_to_f32(rope_sin_bf16[i]);
++    }
++
++    /* Both paths receive the same values, the F32 path the BF16 truncation
++     * widened back, so the two must agree bit for bit. */
++    h3_gpu_tensor *f32_qkv = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, wide_qkv, QKV_COUNT));
++    h3_gpu_tensor *f32_cos = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, wide_cos, ROPE_COUNT));
++    h3_gpu_tensor *f32_sin = own(test, h3_gpu_tensor_from_f32(
++        test->gpu, wide_sin, ROPE_COUNT));
++    h3_gpu_tensor *f32_query = own(test, h3_gpu_tensor_new_f32(test->gpu, COUNT));
++    h3_gpu_tensor *f32_key = own(test, h3_gpu_tensor_new_f32(test->gpu, COUNT));
++    h3_gpu_tensor *f32_value = own(test, h3_gpu_tensor_new_f32(test->gpu, COUNT));
++    h3_gpu_tensor *bf16_qkv = own(test, h3_gpu_tensor_from_bf16(
++        test->gpu, qkv_bf16, QKV_COUNT));
++    h3_gpu_tensor *bf16_cos = own(test, h3_gpu_tensor_from_bf16(
++        test->gpu, rope_cos_bf16, ROPE_COUNT));
++    h3_gpu_tensor *bf16_sin = own(test, h3_gpu_tensor_from_bf16(
++        test->gpu, rope_sin_bf16, ROPE_COUNT));
++    h3_gpu_tensor *bf16_query = own(test, h3_gpu_tensor_new_bf16(test->gpu, COUNT));
++    h3_gpu_tensor *bf16_key = own(test, h3_gpu_tensor_new_bf16(test->gpu, COUNT));
++    h3_gpu_tensor *bf16_value = own(test, h3_gpu_tensor_new_bf16(test->gpu, COUNT));
++
++    require_gpu(test, h3_gpu_begin(test->gpu),
++                "begin epsilon command stream");
++    require_gpu(test, h3_gpu_video_qkv_rope_f32(test->gpu, f32_query,
++               f32_key, f32_value, f32_qkv, f32_cos, f32_sin, ROWS, HEADS,
++               HEAD_DIM, ROPE_HALF, epsilon), "encode F32 video QKV");
++    require_gpu(test, h3_gpu_video_qkv_rope_bf16(test->gpu, bf16_query,
++               bf16_key, bf16_value, bf16_qkv, bf16_cos, bf16_sin, ROWS,
++               HEADS, HEAD_DIM, ROPE_HALF, epsilon),
++               "encode BF16 video QKV");
++    require_gpu(test, h3_gpu_submit(test->gpu),
++                "submit epsilon command stream");
++
++    uint16_t *bf16_query_result = malloc((size_t)COUNT * sizeof(uint16_t));
++    uint16_t *bf16_key_result = malloc((size_t)COUNT * sizeof(uint16_t));
++    require(bf16_query_result && bf16_key_result, "host allocation failed");
++    require(h3_gpu_tensor_read_f32(f32_query, reference_query, COUNT),
++            "cannot read F32 query");
++    require(h3_gpu_tensor_read_f32(f32_key, reference_key, COUNT),
++            "cannot read F32 key");
++    require(h3_gpu_tensor_read_f32(f32_value, reference_value, COUNT),
++            "cannot read F32 value");
++    require(h3_gpu_tensor_read_bf16(bf16_query, bf16_query_result, COUNT),
++            "cannot read BF16 query");
++    require(h3_gpu_tensor_read_bf16(bf16_key, bf16_key_result, COUNT),
++            "cannot read BF16 key");
++
++    /* The F32 path must reproduce the reference with the epsilon inside the
++     * square root of the mean of the squares. */
++    reference_qkv_rope(wide_qkv, wide_cos, wide_sin, host_query, host_key,
++                       host_value, ROWS, HEADS, HEAD_DIM, ROPE_HALF,
++                       (double)epsilon);
++    comparison host_error = compare(host_query, reference_query, COUNT);
++    printf("epsilon %.3g: F32 path vs host reference rel-L2 %.4g\n",
++           (double)epsilon, host_error.rel_l2);
++    require(host_error.rel_l2 < 1e-5,
++            "F32 path ignores the epsilon or places it wrongly");
++
++    /* A norm that dropped the epsilon would scale the query by a visibly
++     * different factor, so the two must differ. */
++    float *host_no_epsilon = malloc((size_t)COUNT * sizeof(float));
++    float *host_no_epsilon_key = malloc((size_t)COUNT * sizeof(float));
++    float *host_no_epsilon_value = malloc((size_t)COUNT * sizeof(float));
++    require(host_no_epsilon && host_no_epsilon_key && host_no_epsilon_value,
++            "host allocation failed");
++    reference_qkv_rope(wide_qkv, wide_cos, wide_sin, host_no_epsilon,
++                       host_no_epsilon_key, host_no_epsilon_value, ROWS,
++                       HEADS, HEAD_DIM, ROPE_HALF, 0.0);
++    comparison epsilon_effect = compare(host_no_epsilon, reference_query,
++                                        COUNT);
++    printf("epsilon %.3g: effect on the query rel-L2 %.4g\n",
++           (double)epsilon, epsilon_effect.rel_l2);
++    require(epsilon_effect.rel_l2 > 1e-3,
++            "the epsilon probe is not sensitive enough to be conclusive");
++
++    /* The BF16 path must be the BF16 rounding of the F32 path. */
++    size_t query_exact = 0;
++    size_t key_exact = 0;
++    for (size_t i = 0; i < COUNT; i++) {
++        if (f32_to_bf16(reference_query[i]) == bf16_query_result[i])
++            query_exact++;
++        if (f32_to_bf16(reference_key[i]) == bf16_key_result[i]) key_exact++;
++    }
++    printf("epsilon %.3g: BF16 query %zu/%d bit-exact, key %zu/%d bit-exact "
++           "against the F32 path\n",
++           (double)epsilon, query_exact, COUNT, key_exact, COUNT);
++    require(query_exact == COUNT, "BF16 query ignores the epsilon");
++    require(key_exact == COUNT, "BF16 key ignores the epsilon");
++
++    free(qkv); free(rope_cos); free(rope_sin);
++    free(qkv_bf16); free(rope_cos_bf16); free(rope_sin_bf16);
++    free(wide_qkv); free(wide_cos); free(wide_sin);
++    free(reference_query); free(reference_key); free(reference_value);
++    free(host_query); free(host_key); free(host_value);
++    free(bf16_query_result); free(bf16_key_result);
++    free(host_no_epsilon); free(host_no_epsilon_key);
++    free(host_no_epsilon_value);
++}
++
++int main(int argc, char **argv) {
++    /* The shader path may be given explicitly so the test does not depend on
++     * the working directory. */
++    const char *shader = argc > 1 ? argv[1] : "h3_shaders.metal";
++    char error[512];
++    gpu_test test;
++    memset(&test, 0, sizeof(test));
++    test.gpu = h3_gpu_create(shader, error, sizeof(error));
++    if (!test.gpu) {
++        fprintf(stderr, "FAIL tests/test_gpu_bf16_ops.c: %s\n", error);
++        return 1;
++    }
++    printf("video qkv geometry: rows %d, heads %d, head_dim %d, rope_half %d\n",
++           ROWS, HEADS, HEAD_DIM, ROPE_HALF);
++    test_scale_add(&test);
++    test_qkv_rope(&test);
++    test_epsilon_placement(&test);
++    release(&test);
++    h3_gpu_free(test.gpu);
++    printf("ok: BF16 video VAE primitives match their F32 counterparts\n");
++    return 0;
++}
+diff --git a/tests/test_video_vae.c b/tests/test_video_vae.c
+new file mode 100644
+index 0000000..dc3fc30
+--- /dev/null
++++ b/tests/test_video_vae.c
+@@ -0,0 +1,368 @@
++/* A/B comparison of the video VAE decoder in its two supported precisions.
++ *
++ * The decoder normally runs in BF16 so that the MPS matmul and SDPA paths
++ * can use the Apple tensor cores. H3_VAE_PRECISION=f32 keeps the original
++ * float32 path. This test decodes the same fixed pseudo-random latent with
++ * both paths and reports the timing and the numerical difference.
++ *
++ * Usage:
++ *   h3_video_vae_tests [model_root] [shader] [latent_h] [latent_w]
++ *                       [latent_time]
++ *
++ * H3_VAE_TEST_TILES may hold a comma separated list of spatial tile sizes
++ * (for example "256,304"); every entry is measured, compared against the
++ * float32 path, and compared against the first entry so the effect of the
++ * tile size on the decoded frames is visible.
++ */
++#include "h3_video_vae.h"
++
++#include <math.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++enum {
++    /* The released decoder consumes 24 latent channels and a 16x pixel ratio.
++     * The default geometry keeps the test quick; the full 960x544x124 frame
++     * target can be requested from the command line. */
++    LATENT_CHANNELS = 24,
++    DEFAULT_LATENT_TIME = 7,
++    DEFAULT_LATENT_HEIGHT = 8,
++    DEFAULT_LATENT_WIDTH = 12,
++    SPATIAL_RATIO = 16
++};
++
++typedef struct {
++    double load_seconds;
++    double decode_seconds;
++    double gpu_seconds;
++    unsigned long long mps_linears;
++    unsigned long long mps_sdpa;
++    unsigned long long submissions;
++    unsigned long long peak_live_bytes;
++    int frames;
++    int height;
++    int width;
++    float *rgb;
++} decode_result;
++
++typedef struct {
++    double rel_l2;
++    double max_abs;
++    double mean_abs;
++    double reference_min;
++    double reference_max;
++    double other_min;
++    double other_max;
++} comparison;
++
++typedef struct {
++    int tile_pixels;
++    decode_result f32;
++    decode_result bf16;
++} tile_result;
++
++static int latent_time = DEFAULT_LATENT_TIME;
++static int latent_height = DEFAULT_LATENT_HEIGHT;
++static int latent_width = DEFAULT_LATENT_WIDTH;
++
++static void die(const char *message) {
++    fprintf(stderr, "FAIL tests/test_video_vae.c: %s\n", message);
++    exit(1);
++}
++
++static double now_seconds(void) {
++    struct timespec value;
++    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0.0;
++    return (double)value.tv_sec + (double)value.tv_nsec / 1e9;
++}
++
++static void progress(int completed, int total, void *opaque) {
++    (void)completed;
++    (void)total;
++    (void)opaque;
++}
++
++/* A fixed linear congruential generator keeps the comparison reproducible
++ * across runs, machines, and precisions. */
++static void fill_latent(float *values, size_t count) {
++    uint64_t state = 0x9e3779b97f4a7c15ull;
++    for (size_t index = 0; index < count; index++) {
++        state = state * 6364136223846793005ull + 1442695040888963407ull;
++        uint32_t bits = (uint32_t)(state >> 32);
++        float unit = (float)(bits & 0xffffffu) / (float)0xffffffu;
++        values[index] = (3.0f * unit - 1.5f) * 2.0f;
++    }
++}
++
++/* Loads the whole checkpoint in the given precision and reports how long the
++ * weight upload takes. The video VAE checkpoint stores 560 F32 tensors, so
++ * the BF16 path pays an extra host-side F32 -> BF16 conversion on top of the
++ * upload. */
++static int load_benchmark(const char *weights, const char *shader,
++                          const char *precision, int repeats) {
++    double *samples = malloc((size_t)repeats * sizeof(*samples));
++    if (!samples) die("out of memory allocating load samples");
++    double minimum = INFINITY, total = 0.0;
++    for (int index = 0; index < repeats; index++) {
++        char error[512];
++        setenv("H3_VAE_PRECISION", precision, 1);
++        double start = now_seconds();
++        h3_video_vae_decoder *decoder = h3_video_vae_decoder_load(
++                            weights, shader, latent_height, latent_width,
++                            progress, NULL, error, sizeof(error));
++        double elapsed = now_seconds() - start;
++        if (!decoder) {
++            fprintf(stderr, "h3: %s video VAE load failed: %s\n", precision,
++                    error);
++            free(samples);
++            return 0;
++        }
++        h3_video_vae_decoder_free(decoder);
++        samples[index] = elapsed;
++        if (elapsed < minimum) minimum = elapsed;
++        total += elapsed;
++    }
++    for (int index = 0; index < repeats; index++)
++        if (samples[index] < minimum) minimum = samples[index];
++    printf("  %-5s: %d loads, min %7.3f s, mean %7.3f s\n", precision,
++           repeats, minimum, total / (double)repeats);
++    free(samples);
++    return 1;
++}
++
++static int decode_with(const char *weights, const char *shader,
++                       const char *precision, int tile_pixels,
++                       const float *latent, decode_result *result) {
++    char error[512];
++    char tile[32];
++    setenv("H3_VAE_PRECISION", precision, 1);
++    if (tile_pixels > 0) {
++        snprintf(tile, sizeof(tile), "%d", tile_pixels);
++        setenv("H3_VAE_TILE_PIXELS", tile, 1);
++    } else {
++        unsetenv("H3_VAE_TILE_PIXELS");
++    }
++    memset(result, 0, sizeof(*result));
++    double start = now_seconds();
++    h3_video_vae_decoder *decoder = h3_video_vae_decoder_load(
++                        weights, shader, latent_height, latent_width,
++                        progress, NULL, error, sizeof(error));
++    if (!decoder) {
++        fprintf(stderr, "h3: %s video VAE load failed: %s\n", precision, error);
++        return 0;
++    }
++    result->load_seconds = now_seconds() - start;
++    h3_video_frames frames;
++    memset(&frames, 0, sizeof(frames));
++    start = now_seconds();
++    int ok = h3_video_vae_decoder_decode(decoder, latent, latent_time,
++                                          &frames, error, sizeof(error));
++    result->decode_seconds = now_seconds() - start;
++    if (!ok) {
++        fprintf(stderr, "h3: %s video VAE decode failed: %s\n", precision,
++                error);
++        h3_video_vae_decoder_free(decoder);
++        return 0;
++    }
++    result->gpu_seconds = frames.gpu_stats.gpu_seconds;
++    result->mps_linears = frames.gpu_stats.mps_linear_dispatches;
++    result->mps_sdpa = frames.gpu_stats.mps_sdpa_dispatches;
++    result->submissions = frames.gpu_stats.submissions;
++    result->peak_live_bytes = frames.gpu_stats.peak_live_bytes;
++    result->frames = frames.frames;
++    result->height = frames.height;
++    result->width = frames.width;
++    result->rgb = frames.rgb;
++    h3_video_vae_decoder_free(decoder);
++    return 1;
++}
++
++static int compare(const decode_result *reference, const decode_result *other,
++                   comparison *out) {
++    size_t count = (size_t)reference->frames * (size_t)reference->height *
++                   (size_t)reference->width * 3;
++    if (count != (size_t)other->frames * (size_t)other->height *
++                  (size_t)other->width * 3) return 0;
++    double square_error = 0.0, square_value = 0.0, absolute = 0.0;
++    double maximum = 0.0;
++    double reference_min = INFINITY, reference_max = -INFINITY;
++    double other_min = INFINITY, other_max = -INFINITY;
++    for (size_t index = 0; index < count; index++) {
++        double want = (double)reference->rgb[index];
++        double got = (double)other->rgb[index];
++        double delta = got - want;
++        double magnitude = fabs(delta);
++        if (magnitude > maximum) maximum = magnitude;
++        absolute += magnitude;
++        square_error += delta * delta;
++        square_value += want * want;
++        if (want < reference_min) reference_min = want;
++        if (want > reference_max) reference_max = want;
++        if (got < other_min) other_min = got;
++        if (got > other_max) other_max = got;
++    }
++    out->rel_l2 = square_value > 1e-24 ?
++        sqrt(square_error / square_value) : sqrt(square_error);
++    out->max_abs = maximum;
++    out->mean_abs = count ? absolute / (double)count : 0.0;
++    out->reference_min = reference_min;
++    out->reference_max = reference_max;
++    out->other_min = other_min;
++    out->other_max = other_max;
++    return 1;
++}
++
++static void print_delta(const char *label, const comparison *stats) {
++    printf("  %-28s rel-L2 %.6g, max |delta| %.6g, mean |delta| %.6g\n",
++           label, stats->rel_l2, stats->max_abs, stats->mean_abs);
++}
++
++static int decode_tile(const char *weights, const char *shader, int tile_pixels,
++                       const float *latent, tile_result *out) {
++    out->tile_pixels = tile_pixels;
++    if (!decode_with(weights, shader, "f32", tile_pixels, latent, &out->f32))
++        die("the float32 video VAE decode failed");
++    if (!decode_with(weights, shader, "bf16", tile_pixels, latent, &out->bf16))
++        die("the BF16 video VAE decode failed");
++    if (out->f32.frames != out->bf16.frames ||
++        out->f32.height != out->bf16.height ||
++        out->f32.width != out->bf16.width)
++        die("the float32 and BF16 decodes disagree on the output shape");
++    if (out->f32.frames < 1 || out->f32.height < 1 || out->f32.width < 1)
++        die("the video VAE produced an empty frame");
++    if (out->f32.height != latent_height * SPATIAL_RATIO ||
++        out->f32.width != latent_width * SPATIAL_RATIO)
++        die("the video VAE produced the wrong pixel resolution");
++    int expected_frames = ((latent_time - 2) / 5) * 17 + 5;
++    if (out->f32.frames != expected_frames) {
++        fprintf(stderr, "h3: expected %d decoded frames, got %d\n",
++                expected_frames, out->f32.frames);
++        exit(1);
++    }
++    return 1;
++}
++
++static void print_tile(const tile_result *tile) {
++    printf("video VAE decode: %d frames at %dx%d, tile %d px\n",
++           tile->f32.frames, tile->f32.height, tile->f32.width,
++           tile->tile_pixels);
++    printf("  F32 : load %7.3f s, decode %7.3f s, GPU %7.3f s, "
++           "%llu MPS linears, %llu MPS SDPA, peak %.2f GiB\n",
++           tile->f32.load_seconds, tile->f32.decode_seconds,
++           tile->f32.gpu_seconds, tile->f32.mps_linears,
++           tile->f32.mps_sdpa,
++           (double)tile->f32.peak_live_bytes / (1024.0 * 1024.0 * 1024.0));
++    printf("  BF16: load %7.3f s, decode %7.3f s, GPU %7.3f s, "
++           "%llu MPS linears, %llu MPS SDPA, peak %.2f GiB\n",
++           tile->bf16.load_seconds, tile->bf16.decode_seconds,
++           tile->bf16.gpu_seconds, tile->bf16.mps_linears,
++           tile->bf16.mps_sdpa,
++           (double)tile->bf16.peak_live_bytes / (1024.0 * 1024.0 * 1024.0));
++    if (tile->bf16.decode_seconds > 0.0)
++        printf("  BF16 decode speedup: %.2fx\n",
++               tile->f32.decode_seconds / tile->bf16.decode_seconds);
++}
++
++int main(int argc, char **argv) {
++    const char *model_root = argc > 1 ? argv[1] : "MiniMax-H3";
++    const char *shader = argc > 2 ? argv[2] : "h3_shaders.metal";
++    char weights[1024];
++    snprintf(weights, sizeof(weights), "%s/FL2VA/video_vae/source",
++             model_root);
++    if (argc > 3) latent_height = atoi(argv[3]);
++    if (argc > 4) latent_width = atoi(argv[4]);
++    if (argc > 5) latent_time = atoi(argv[5]);
++    if (latent_height < 1 || latent_width < 1 || latent_time < 7)
++        die("invalid latent geometry");
++    size_t latent_count = (size_t)LATENT_CHANNELS * (size_t)latent_time *
++                          (size_t)latent_height * (size_t)latent_width;
++    float *latent = malloc(latent_count * sizeof(*latent));
++    if (!latent) die("out of memory allocating the test latent");
++    fill_latent(latent, latent_count);
++
++    int tiles[8];
++    int tile_count = 0;
++    const char *list = getenv("H3_VAE_TEST_TILES");
++    if (list && *list) {
++        char buffer[256];
++        snprintf(buffer, sizeof(buffer), "%s", list);
++        char *cursor = buffer;
++        while (cursor && *cursor && tile_count < 8) {
++            char *comma = strchr(cursor, ',');
++            if (comma) *comma = '\0';
++            int pixels = atoi(cursor);
++            if (pixels > 0) tiles[tile_count++] = pixels;
++            cursor = comma ? comma + 1 : NULL;
++        }
++    }
++    if (!tile_count) tiles[tile_count++] = 0;
++
++    const char *loads = getenv("H3_VAE_TEST_LOADS");
++    if (loads && *loads) {
++        int repeats = atoi(loads);
++        if (repeats < 1) repeats = 1;
++        printf("video VAE weight load (36 blocks, F32 checkpoint):\n");
++        if (!load_benchmark(weights, shader, "f32", repeats))
++            die("the float32 video VAE load benchmark failed");
++        if (!load_benchmark(weights, shader, "bf16", repeats))
++            die("the BF16 video VAE load benchmark failed");
++    }
++
++    int ok = 1;
++    tile_result baseline;
++    memset(&baseline, 0, sizeof(baseline));
++    for (int index = 0; index < tile_count; index++) {
++        tile_result tile;
++        memset(&tile, 0, sizeof(tile));
++        decode_tile(weights, shader, tiles[index], latent, &tile);
++        printf("--- spatial tile %d px ---\n", tiles[index]);
++        print_tile(&tile);
++        comparison precision;
++        if (!compare(&tile.f32, &tile.bf16, &precision))
++            die("the float32 and BF16 decodes produced different pixel counts");
++        print_delta("BF16 vs F32:", &precision);
++        printf("  RGB range: F32 [%.6g, %.6g], BF16 [%.6g, %.6g]\n",
++               precision.reference_min, precision.reference_max,
++               precision.other_min, precision.other_max);
++        if (precision.rel_l2 > 0.01) {
++            fprintf(stderr, "h3: the BF16 decoder exceeds the rel-L2 0.01 "
++                            "bound (%.6g)\n", precision.rel_l2);
++            ok = 0;
++        }
++        if (precision.other_min < -1e-6 || precision.other_max > 1.0 + 1e-6) {
++            fprintf(stderr, "h3: the BF16 decoder left the [0,1] RGB range\n");
++            ok = 0;
++        }
++        if (index == 0) {
++            baseline = tile;
++            continue;
++        }
++        comparison tiles_f32;
++        if (compare(&baseline.f32, &tile.f32, &tiles_f32)) {
++            char label[64];
++            snprintf(label, sizeof(label), "tile %d vs %d (F32):",
++                     tiles[index], baseline.tile_pixels);
++            print_delta(label, &tiles_f32);
++        }
++        comparison tiles_bf16;
++        if (compare(&baseline.bf16, &tile.bf16, &tiles_bf16)) {
++            char label[64];
++            snprintf(label, sizeof(label), "tile %d vs %d (BF16):",
++                     tiles[index], baseline.tile_pixels);
++            print_delta(label, &tiles_bf16);
++        }
++        free(tile.f32.rgb);
++        free(tile.bf16.rgb);
++    }
++    if (baseline.f32.rgb) {
++        free(baseline.f32.rgb);
++        free(baseline.bf16.rgb);
++    }
++    free(latent);
++    if (!ok) exit(1);
++    puts("ok: the BF16 video VAE matches the float32 decoder");
++    return 0;
++}
+-- 
+2.53.0
+

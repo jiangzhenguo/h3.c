@@ -1,0 +1,82 @@
+[    0.00] [NORMAL] libavutil: using '/opt/homebrew/lib/libavutil.dylib'
+[    0.01] [NORMAL] libavcodec: using '/opt/homebrew/lib/libavcodec.dylib'
+[    0.02] [NORMAL] libswresample: using '/opt/homebrew/lib/libswresample.dylib'
+[    0.02] [NORMAL] libswscale: using '/opt/homebrew/lib/libswscale.dylib'
+[    0.03] [NORMAL] libavformat: using '/opt/homebrew/lib/libavformat.dylib'
+[    0.03] [NORMAL] libavdevice: using '/opt/homebrew/lib/libavdevice.dylib'
+[    0.03] [NORMAL] libavfilter: using '/opt/homebrew/lib/libavfilter.dylib'
+[    0.03] [INFO] PipelineRuntime: pipeline 'h3-t2v-compare' has 3 clock domains; domain 0 = {audio-vae-decode, minimax-h3-model-config, diffusion-conditioner, text-prompt, model-select}; domain 1 = {}; domain 2 = {rgb-to-video}; crossers = {save-video, vae-decode, generate-video}
+[    0.06] [INFO] memory landscape at launch: 65536 MB RAM -- 9035 MB idle, 35180 MB file cache, 6580 MB wired system-wide, 4375 MB compressed, 7377 MB swap; this process holds 7 MB
+[    0.06] [INFO] memory landscape: wired pool 49151 MB of 53084 MB the GPU can keep resident, 0 MB of it already in use
+[    0.16] [INFO] resource-plan: 5 activation arena(s) declared, 4623 MB; peak across phases 4062 MB
+[    0.16] [INFO] resource-plan: 137344 MB of model weights declared before init (137344 MB of claims, before shared checkpoints are counted once)
+[    0.16] [INFO] resource-plan: 64201 MB preloaded / 10510 MB if every streamable component streams
+[    0.16] [INFO] resource-plan: 126834 MB of that is phase-limited; peak across phases 64201 MB
+[    0.16] [INFO] resource-plan: peak 11070 MB in phase 'decode' (condition 6740 MB, denoise 7753 MB, decode-audio 585 MB, decode 11070 MB)
+[    0.26] [INFO] memory-plan (declared): peak 9936 MB at 'vae-decode' streaming, 67272 MB at 'generate-video' preloaded, over 9 stages in running order (diffusion-conditioner 6162 MB, generate-video 7176 MB, vae-decode 9936 MB, rgb-to-video 0 MB, audio-vae-decode 577 MB)
+[    0.26] vpipe: launched pipeline 'h3-t2v-compare.vpipeline'
+[    0.26] [INFO] MiniMaxH3ModelConfigStage('minimax-h3-model-config'): shifts 12.0/3.0, condition t 1.000/1.000, audio as long as the video
+[    0.26] [INFO] ModelSelectStage('model-select'): model = '/Users/jiangzhenguo/ai/h3/MiniMax-H3/FL2VA'
+[    0.26] [INFO] GenerateVideoStage('generate-video'): MiniMax-H3 partition 'fl2va' (models DB says model_type '-', so probed the checkpoint)
+[    0.26] [INFO] GenerateVideoStage('generate-video'): MiniMax-H3 (video+audio) at 960x544x124 frames, 6 steps, shifts 12.0/3.0
+[    0.40] [INFO] AudioVaeDecodeStage('audio-vae-decode'): minimax-h3 audio VAE loaded -- 32000 Hz, 32 latent channels, hop 800 (40 latents/s), unload_when_idle=yes
+[    0.92] [INFO] DiffusionConditionerStage('diffusion-conditioner'): MiniMax-H3 encoder streams its 50 layers through a slot pair, the next read under this layer's GPU work; the layers it keeps grow into free memory as it runs
+[    0.92] [INFO] DiffusionConditionerStage('diffusion-conditioner'): family minimax-h3 encoder (Qwen3-VL-32B (layer-50 tap)), hidden 5120
+[    0.92] [INFO] DiffusionConditionerStage('diffusion-conditioner'): memory-bounded -- the encoder is dropped after each conditioning and reloaded on the next prompt
+[    7.91] [INFO] GenerateVideoStage('generate-video'): generation 1, seed 42
+[    8.00] [INFO] GenerateVideoStage('generate-video'): MiniMax-H3 footprint 38 GB (others 62 GB, less 24 GB the AdaLN bake retires) + 8 GB headroom -> STREAM blocks
+[    8.40] [INFO] GenerateVideoStage('generate-video'): memory-bounded -- the DiT is dropped after each clip so the VAE decode has working set, and reloads on the next prompt (its blocks stream, so the box is already tight)
+[    8.41] [INFO] memory-plan (generate-video): peak 9936 MB at 'vae-decode' streaming, 63624 MB at 'diffusion-conditioner' preloaded, over 9 stages in running order (diffusion-conditioner 6162 MB, generate-video 7176 MB, vae-decode 9936 MB, rgb-to-video 0 MB, audio-vae-decode 577 MB)
+[    8.41] [INFO] GenerateVideoStage('generate-video'): MiniMax-H3 DiT streams its 50 blocks; the resident set grows into free RAM as the denoise runs and is given back when the box needs it
+[    8.41] [INFO] GenerateVideoStage('generate-video'): reclaimable RAM ~41793 MB + up to 4096 MB the OS can swap (4096 MB allowed by swap_allowance_mb, 4121 MB other processes are actually holding); 5% margin
+[   12.44] [INFO] MetalMiniMaxH3Transformer: residency probe 50 blocks of 50 (735 MB each, 41380 MB reclaimable, wire budget 49151 MB) -- uncapped, the wire budget is the gate
+[   12.44] [NORMAL] MetalMiniMaxH3Transformer: baked AdaLN for 6 steps (11 rows) -- 51 projections (24870 MB of weights) replaced by 101 MB of tables, and no longer streamed per step
+[   16.32] [NORMAL] MetalMiniMaxH3Transformer: rope table bf16, angles fp32 -- matching ComfyUI / diffusers
+[   16.35] [NORMAL] [h3-dit] first forward at 19386 rows: 3912 ms before block 0 (scratch 0, residency+wire 141, gemm autotune 3746, rope/temb/attn setup 25)
+[   17.30] [PROGRESS] 0% of 'denoise' completed at 22:45:08 (0/300)
+[   26.10] [NORMAL] MetalMiniMaxH3Transformer: attention query tile -> BQ 128 (per-block median: BQ 64 1151.4 ms, BQ 128 1107.4 ms over 6 probe blocks)
+[   54.86] [PROGRESS] 10% of 'denoise' completed at 22:45:45 (30/300)
+[   94.78] [PROGRESS] 20% of 'denoise' completed at 22:46:25 (60/300)
+[  131.71] [PROGRESS] 30% of 'denoise' completed at 22:47:02 (90/300)
+[  169.83] [PROGRESS] 40% of 'denoise' completed at 22:47:40 (120/300)
+[  208.97] [PROGRESS] 50% of 'denoise' completed at 22:48:19 (150/300)
+[  251.86] [PROGRESS] 60% of 'denoise' completed at 22:49:02 (180/300)
+[  294.35] [PROGRESS] 70% of 'denoise' completed at 22:49:45 (210/300)
+[  337.28] [PROGRESS] 80% of 'denoise' completed at 22:50:28 (240/300)
+[  380.40] [PROGRESS] 90% of 'denoise' completed at 22:51:11 (270/300)
+[  422.50] [INFO] memory-plan (generate-video): peak 42496 MB at 'generate-video' streaming, 63624 MB at 'diffusion-conditioner' preloaded, over 9 stages in running order (diffusion-conditioner 6162 MB, generate-video 42496 MB, vae-decode 9936 MB, rgb-to-video 0 MB, audio-vae-decode 577 MB)
+[  422.50] [INFO] GenerateVideoStage('generate-video'): DiT residency ended at 50 of 50 blocks (36751 MB), 0 pinned at load
+[  422.52] [PROGRESS] 'denoise' ended at 22:51:53, last reported 99% (298/300)
+[  423.77] [INFO] GenerateVideoStage('generate-video'): emitted MiniMax-H3 latents #1 -- video [24, 37, 34, 60] + audio [2, 32, 207]
+[  423.78] [INFO] VaeDecodeStage('vae-decode'): loading the MiniMax-H3 video VAE from '/Users/jiangzhenguo/ai/h3/MiniMax-H3/FL2VA/video_vae'
+[  423.98] [INFO] AudioVaeDecodeStage('audio-vae-decode'): decoded clip #1 -- 207 latent frames -> 2 x 165600 samples (5.17 s at 32000 Hz)
+[  425.93] [PROGRESS] 0% of 'vae decode' completed at 22:51:56 (0/105)
+[  431.81] [PROGRESS] 10% of 'vae decode' completed at 22:52:02 (11/105)
+[  437.62] [PROGRESS] 20% of 'vae decode' completed at 22:52:08 (21/105)
+[  444.09] [PROGRESS] 30% of 'vae decode' completed at 22:52:14 (32/105)
+[  449.83] [PROGRESS] 40% of 'vae decode' completed at 22:52:20 (42/105)
+[  456.56] [PROGRESS] 50% of 'vae decode' completed at 22:52:27 (53/105)
+[  462.56] [PROGRESS] 60% of 'vae decode' completed at 22:52:33 (63/105)
+[  469.07] [PROGRESS] 70% of 'vae decode' completed at 22:52:39 (74/105)
+[  475.16] [PROGRESS] 80% of 'vae decode' completed at 22:52:46 (84/105)
+[  482.24] [PROGRESS] 90% of 'vae decode' completed at 22:52:53 (95/105)
+[  488.68] [PROGRESS] 'vae decode' ended at 22:52:59, last reported 99% (104/105)
+[  489.07] [INFO] PipelineRuntime: pipeline 'h3-t2v-compare' ran for 8 m 09 s
+[  489.14]       489.17 real         6.98 user        15.26 sys
+[  489.14]          44230197248  maximum resident set size
+[  489.14]                    0  average shared memory size
+[  489.14]                    0  average unshared data size
+[  489.14]                    0  average unshared stack size
+[  489.14]              7331477  page reclaims
+[  489.14]                 2082  page faults
+[  489.14]                    0  swaps
+[  489.14]                    0  block input operations
+[  489.14]                    0  block output operations
+[  489.14]                    0  messages sent
+[  489.14]                    0  messages received
+[  489.14]                    0  signals received
+[  489.14]               118835  voluntary context switches
+[  489.14]                39225  involuntary context switches
+[  489.14]         205425737491  instructions retired
+[  489.14]          85447873051  cycles elapsed
+[  489.14]          45921092512  peak memory footprint

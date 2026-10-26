@@ -1,0 +1,5 @@
+[23:15:28] ===== COOLDOWN 600s before VPIPE (i8_gemm OFF) =====
+[23:25:28] ===== VPIPE run4 (i8_gemm OFF, cool start) =====
+[23:34:55] VPIPE run4 done
+[23:34:55] ===== DONE =====
+/Users/jiangzhenguo/ai/vpipe-work/controlled-bench-i8off.sh: line 28: 19898 Terminated: 15          bash "$WORK/sample-thermal.sh" "$WORK/thermal-vpipe4.log" 900

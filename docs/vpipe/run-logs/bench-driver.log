@@ -1,0 +1,9 @@
+[22:34:50] ===== COOLDOWN 600s before VPIPE =====
+[22:44:50] ===== VPIPE run3 (cool start) =====
+[22:53:00] VPIPE run3 exit=0
+[22:53:00] ===== COOLDOWN 600s before h3.c =====
+/Users/jiangzhenguo/ai/vpipe-work/controlled-bench.sh: line 33: 13996 Terminated: 15          bash "$WORK/sample-thermal.sh" "$WORK/thermal-vpipe3.log" 900
+[23:03:00] ===== h3.c run3 (cool start) =====
+[23:11:14] h3.c run3 exit=0
+[23:11:14] ===== DONE =====
+/Users/jiangzhenguo/ai/vpipe-work/controlled-bench.sh: line 53: 16497 Terminated: 15          bash "$WORK/sample-thermal.sh" "$WORK/thermal-h3c3.log" 900
