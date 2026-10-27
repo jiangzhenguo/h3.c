@@ -1,0 +1,11 @@
+{"build": "fork", "prec": "bf16", "tile": 256, "cached": false, "wall_s": 83.07, "name": "pbf16-0", "load_s": 1.06, "decode_s": 80.98, "psnr_db": 60.14, "max_abs": 0.08864, "rmse": 0.000984, "frames": 124, "out": "960x544"}
+{"build": "fork", "prec": "int8", "tile": 256, "cached": false, "wall_s": 69.7, "name": "pint8-0", "load_s": 6.71, "decode_s": 61.85, "psnr_db": 51.94, "max_abs": 0.22032, "rmse": 0.00253, "frames": 124, "out": "960x544"}
+PAIR 0: bf16 80.98s (psnr 60.14)  int8 61.85s (psnr 51.94)  ratio int8/bf16 = 0.764
+{"build": "fork", "prec": "bf16", "tile": 256, "cached": false, "wall_s": 91.99, "name": "pbf16-1", "load_s": 4.58, "decode_s": 86.76, "psnr_db": 60.14, "max_abs": 0.08864, "rmse": 0.000984, "frames": 124, "out": "960x544"}
+{"build": "fork", "prec": "int8", "tile": 256, "cached": false, "wall_s": 55.3, "name": "pint8-1", "load_s": 1.62, "decode_s": 52.99, "psnr_db": 51.94, "max_abs": 0.22032, "rmse": 0.00253, "frames": 124, "out": "960x544"}
+PAIR 1: bf16 86.76s (psnr 60.14)  int8 52.99s (psnr 51.94)  ratio int8/bf16 = 0.611
+{"build": "fork", "prec": "bf16", "tile": 256, "cached": false, "wall_s": 84.35, "name": "pbf16-2", "load_s": 1.64, "decode_s": 81.95, "psnr_db": 60.14, "max_abs": 0.08864, "rmse": 0.000984, "frames": 124, "out": "960x544"}
+{"build": "fork", "prec": "int8", "tile": 256, "cached": false, "wall_s": 57.93, "name": "pint8-2", "load_s": 1.86, "decode_s": 55.48, "psnr_db": 51.94, "max_abs": 0.22032, "rmse": 0.00253, "frames": 124, "out": "960x544"}
+PAIR 2: bf16 81.95s (psnr 60.14)  int8 55.48s (psnr 51.94)  ratio int8/bf16 = 0.677
+SUMMARY ratios [0.764, 0.611, 0.677] median 0.677
+PAIRED DONE

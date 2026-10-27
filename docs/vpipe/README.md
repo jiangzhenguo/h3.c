@@ -70,7 +70,7 @@ docs/vpipe/
 ├── run-logs/                              全部原始日志（VPIPE / h3.c / 热态采样 / 微基准）
 └── media/
     ├── vpipe-960x544-124f-s6-seed42.mp4   VPIPE 产物
-    ├── h3c-*.mp4                          h3.c 各轮产物（bf16 / f32 / f32-304 / run2 / run3）
+    ├── h3c-*.mp4                          h3.c 各轮产物（bf16 / f32 / f32-304 / run2 / run3 / int8）
     └── frames/                            第 60 帧逐像素对照图（h3c_f60.png / vpipe_f60.png）
 ```
 
