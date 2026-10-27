@@ -807,6 +807,44 @@ INT8 解码的误差比视频编码器自身的误差低 30 dB，SSIM 也远高�
 完整实测、失败分析和复现命令见
 [`docs/vpipe/reports/vae-int8-实验报告.md`](docs/vpipe/reports/vae-int8-实验报告.md)。
 
+### 4. 合入本 fork 的上游修复
+
+那些既修真 bug、又不改变合法输入行为的上游 PR，本 fork 直接整条合入（保留上游
+提交本身，而不是逐行挑拣）。每一条都先在独立分支上合并、编译、跑完测试套件，
+再落到 main。
+
+| PR | 上游修复 | 在本机为何安全 |
+|---|---|---|
+| #79 | Metal parity 检查失败时 `make test` 真的会失败 | 只改一个 shell 连接符；本地反正会跳过 fixture 分支 |
+| #63 | 复用 GQA 归约 scratch 前补 `threadgroup_barrier` | 该 barrier 位于一致控制流中；它修掉的是真实存在的写后读竞争（上游 #52），正是它让因果 softmax 不确定 |
+| #44 | 因果 GQA 的 threadgroup 内存长度向上对齐到 16 字节 | Metal 校验层遇到未对齐长度会直接 abort；向上取整只增加内核根本不读的填充 |
+| #9 | 视频 VAE 的 RGB 输出改用 `fminf`/`fmaxf` 钳位 | 对有限值完全等价；NaN 现在落成 0，而不是污染整帧 |
+| #11 | 帧数对齐改用 64 位计算 | 对齐后的帧数放不进 `int` 时 `h3_align_frame_count()` 返回 0，由调用方拒绝 |
+| #62 | stdout 改为行缓冲 | "Done" 行能立刻送到管道客户端；linenoise 的交互提示符走裸 `write()`，REPL 不受影响 |
+| #48 | safetensors 数据区必须连续且完全覆盖 | 本机全部 116 个 `.safetensors`（官方 checkpoint 与 Turbo LoRA 合并产物）都通过新校验 |
+| #74 | JSON 字符串分配按编码长度设上限 | 编码长度是解码后长度的上界，不会截断内容 |
+| #31 | 容忍 FFprobe 紧凑输出末尾多出的 `x` | 带 display matrix side-data 的 iPhone `.mov` 文件 |
+| #59 | 兼容 macOS 26 之前的 SDK 编译 | 补 `<limits.h>`，并给 `MTLGPUFamilyMetal4` 加编译期开关 |
+| #14（部分） | 相对 shader 路径改为相对可执行文件目录解析 | 该 PR 其余部分是功能特性，因此只取这一个提交 |
+
+这张表背后的验证：
+
+- `make test` 通过，1912 项检查，退出码 0。依赖 fixture 的 Metal、tokenizer 与
+  官方权重套件在本机跳过，因为本机没有安装那些 released fixture。
+- 真实权重：`h3 --info -d MiniMax-H3` 让整份 144 GB checkpoint 走一遍新的
+  safetensors 校验；真实权重的视频 VAE 测试用全 NaN latent 解码，并检查输出
+  仍是有限值且落在 [0, 1]。
+- 端到端 A/B：256x256、22 帧、4 步、seed 42，分别用合入前的二进制和合入后的
+  二进制各渲染一次。两者相差 23.05 dB PSNR，而**同一个**合入前二进制跑两次
+  相差 23.13 dB。也就是说这些修复落在流水线自身的 run-to-run 噪声地板之内，
+  不改变生成结果。
+
+#14 的其余部分被有意排除。它的"数据区未对齐就拒绝"检查本身是对的，但它同时
+会拒绝仓库自己的测试夹具：那段 137 字节的 JSON header 让数据区偏离 8 字节边界
+1 个字节，所以上游这份 PR 按提交状态跑不过它自己的 `make test`。该 PR 里的
+Turbo LoRA 折叠工具值得单独取用：它把步数蒸馏 LoRA 烘进 checkpoint，作者实测
+124 帧 960x544 的渲染从 8.8 分钟降到 6.2 分钟。
+
 ### 测试
 
 新增两个测试二进制，并挂进 `make test`：

@@ -970,6 +970,50 @@ through several precision settings, never from comparing two renders.
 Full measurements, the failure analysis and the reproduction commands are in
 [`docs/vpipe/reports/vae-int8-实验报告.md`](docs/vpipe/reports/vae-int8-实验报告.md).
 
+### 4. Upstream fixes merged into this fork
+
+Upstream pull requests that fix real bugs and that leave valid inputs untouched
+were merged as-is, keeping the upstream commits intact instead of cherry-picking
+single lines. Every one of them was merged on a branch, built, and run through
+the test suite before landing.
+
+| PR | Upstream fix | Why it is safe here |
+|---|---|---|
+| #79 | `make test` now fails when the Metal parity check fails | one shell operator; the fixture branch is skipped locally anyway |
+| #63 | `threadgroup_barrier` before the GQA reduction scratch is reused | the barrier sits in uniform control flow, and it removes a real write-after-read hazard (upstream #52) that made the causal softmax nondeterministic |
+| #44 | causal GQA threadgroup memory length rounded up to 16 bytes | Metal aborts on unaligned lengths under the API validation layer; the rounding only adds padding the kernel never reads |
+| #9 | video VAE RGB output clamped with `fminf`/`fmaxf` | identical for finite values; a NaN now lands on 0 instead of poisoning the frame |
+| #11 | frame-count alignment computed in 64 bits | `h3_align_frame_count()` returns 0 when the aligned count does not fit an `int`, and the caller rejects it |
+| #62 | stdout line-buffered | "Done" lines reach piped clients immediately; linenoise writes the interactive prompt with a raw `write()`, so the REPL is unaffected |
+| #48 | the safetensors payload must be contiguous and fully covered | all 116 local `.safetensors` files, the official checkpoint and the Turbo LoRA merges alike, pass the new check |
+| #74 | JSON string allocations bounded by the encoded length | the encoded length is an upper bound for the decoded string, so nothing is truncated |
+| #31 | FFprobe's trailing `x` in the compact size output tolerated | iPhone `.mov` files carrying a display matrix side-data list |
+| #59 | build against SDKs older than macOS 26 | a `<limits.h>` include and a compile-time guard around `MTLGPUFamilyMetal4` |
+| #14 (part) | a relative shader path is resolved against the executable directory | the rest of that PR is a feature, so only the shader-path commit was taken |
+
+The verification behind that table:
+
+- `make test` passes with 1912 checks and exit code 0. The fixture-based Metal,
+  tokenizer and released-weight suites are skipped locally because the released
+  fixtures are not installed on this machine.
+- Real weights: `h3 --info -d MiniMax-H3` inventories the full 144 GB checkpoint
+  through the new safetensors validation, and the real-weight video VAE test
+  decodes an all-NaN latent and checks that the output stays finite and inside
+  [0, 1].
+- End-to-end A/B: 256x256, 22 frames, 4 steps, seed 42, rendered once with the
+  pre-merge binary and once with the merged binary. The two differ by 23.05 dB
+  PSNR, while two runs of the *same* pre-merge binary differ by 23.13 dB. The
+  merged fixes therefore stay inside the pipeline's own run-to-run noise floor
+  and do not change what is generated.
+
+The rest of #14 was deliberately left out. Its "reject a misaligned data
+section" check is correct, but it also rejects the repository's own test
+fixture, whose 137-byte JSON header leaves the payload one byte off the 8-byte
+boundary, so the upstream PR fails its own `make test` as submitted. The Turbo
+LoRA folding tool in that PR is worth taking on its own: it bakes a
+step-distillation LoRA into the checkpoint, and the author reports a 124-frame
+960x544 render going from 8.8 min to 6.2 min.
+
 ### Tests
 
 Two test binaries were added and wired into `make test`:
