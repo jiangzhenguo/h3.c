@@ -876,8 +876,9 @@ FL2VA transformer，结果与此前已经烘好的 checkpoint **逐字节相同*
 张量一致），这交叉验证了折叠结果与之前实测过的模型是同一个。
 
 LoRA 只影响 DiT transformer：text encoder、video VAE、audio VAE 都不受影响，
-所以模型目录里这三块可以直接指向原始快照而不必复制。配合 `cp -c`，折好的
-transformer 真实占用 61 MB，而不是 62 GB。
+所以模型目录里这三块可以用软链指回原始快照，而不必复制。每对模型这样能省下
+145 GB，这正是磁盘占用的大头。transformer 本身必须是真正打过补丁的文件：`cp -c`
+会从原分片克隆一份，未被改动的字节是共享的，补丁只重写受影响的那些区间。
 
 用折好的 Turbo LoRA 采样时：`--steps 5` 或 `6`，**不要**再叠加 `--reuse` 或
 `--core-reuse`——蒸馏调度本身已经把这两者利用的冗余去掉了。4 步会拖影。

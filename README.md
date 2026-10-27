@@ -1051,8 +1051,11 @@ is the cross-check that the bake matches the model that was measured before.
 
 A LoRA only touches the DiT transformer: the text encoder, the video VAE and
 the audio VAE are unaffected, so a model directory can point those at the
-original snapshot instead of copying them. With `cp -c` the folded transformer
-costs 61 MB of real disk instead of 62 GB.
+original snapshot with symlinks instead of copying them. On a full snapshot
+that is 145 GB per model pair, and it is the bulk of the disk. The transformer
+itself has to be a real patched file; `cp -c` clones it from the original
+shard so the untouched bytes are shared, and the patch rewrites only the
+affected ranges.
 
 Sampling with a folded Turbo LoRA: use `--steps 5` or `6`, and do not combine
 it with `--reuse` or `--core-reuse` -- the distilled schedule already removes
