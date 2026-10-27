@@ -1014,6 +1014,50 @@ LoRA folding tool in that PR is worth taking on its own: it bakes a
 step-distillation LoRA into the checkpoint, and the author reports a 124-frame
 960x544 render going from 8.8 min to 6.2 min.
 
+### 5. Folding a Turbo LoRA into the checkpoint
+
+h3.c has no LoRA runtime and does not need one: a LoRA is
+`W' = W + strength*scale*(B@A)`, which can be baked into the checkpoint once,
+offline. `tools/merge_lora_h3.py` does that bake and ships in this fork.
+
+```sh
+python3 tools/merge_lora_h3.py \
+  --lora minimax_h3_turbo_v4_step600_ema.safetensors \
+  --src  ./MiniMax-H3/FL2VA/transformer \
+  --dst  ./MiniMax-H3-turbo/FL2VA/transformer
+```
+
+- Three key conventions are accepted: diffusers/sd-scripts
+  (`lora_unet_blocks_24_attn_qkv_proj.lora_down.weight` with `.lora_up.weight`
+  and `.alpha`), ComfyUI (`diffusion_model.blocks.24...lora_A.weight`), and the
+  checkpoint-key spelling used by `larryvrh/MiniMax-H3-Turbo-Lora`.
+  `--strength` scales the delta, and the sd-scripts `alpha`/rank factor is
+  applied automatically.
+- The shard is copied with `cp -c`, an APFS clone, and only the byte range of
+  each patched tensor is rewritten. The safetensors header, the tensor order
+  and the payload alignment stay byte-identical, so h3.c loads the folded tree
+  unchanged.
+- Every patched tensor is checked against a random probe before any byte is
+  written: `folded@x` must equal `W@x + factor*(B@(A@x))` to 1e-4 relative.
+  That catches a swapped A/B pair, a transposed adapter or a rank mismatch.
+- A LoRA target that is absent from the base checkpoint is a hard error unless
+  `--allow-missing` is given, so a half-folded checkpoint cannot be produced
+  by accident.
+
+Verified on this machine: folding the 259 adapter pairs of
+`minimax_h3_turbo_v4_step600_ema` into the FL2VA transformer reproduces the
+already-merged checkpoint **byte for byte** (535/535 tensors identical), which
+is the cross-check that the bake matches the model that was measured before.
+
+A LoRA only touches the DiT transformer: the text encoder, the video VAE and
+the audio VAE are unaffected, so a model directory can point those at the
+original snapshot instead of copying them. With `cp -c` the folded transformer
+costs 61 MB of real disk instead of 62 GB.
+
+Sampling with a folded Turbo LoRA: use `--steps 5` or `6`, and do not combine
+it with `--reuse` or `--core-reuse` -- the distilled schedule already removes
+the redundancy those flags exploit. Four steps shows motion smear.
+
 ### Tests
 
 Two test binaries were added and wired into `make test`:

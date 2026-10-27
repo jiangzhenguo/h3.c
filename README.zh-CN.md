@@ -845,6 +845,43 @@ INT8 解码的误差比视频编码器自身的误差低 30 dB，SSIM 也远高�
 Turbo LoRA 折叠工具值得单独取用：它把步数蒸馏 LoRA 烘进 checkpoint，作者实测
 124 帧 960x544 的渲染从 8.8 分钟降到 6.2 分钟。
 
+### 5. 把 Turbo LoRA 烘进 checkpoint
+
+h3.c 没有 LoRA 运行时，也不需要：LoRA 就是 `W' = W + strength*scale*(B@A)`，
+可以离线一次性烘进权重。`tools/merge_lora_h3.py` 做这件事，随本 fork 提供。
+
+```sh
+python3 tools/merge_lora_h3.py \
+  --lora minimax_h3_turbo_v4_step600_ema.safetensors \
+  --src  ./MiniMax-H3/FL2VA/transformer \
+  --dst  ./MiniMax-H3-turbo/FL2VA/transformer
+```
+
+- 支持三种键名约定：diffusers/sd-scripts（`lora_unet_blocks_24_attn_qkv_proj
+  .lora_down.weight` 配 `.lora_up.weight` 与 `.alpha`）、ComfyUI
+  （`diffusion_model.blocks.24...lora_A.weight`），以及
+  `larryvrh/MiniMax-H3-Turbo-Lora` 用的 checkpoint 键名拼法。
+  `--strength` 缩放 delta，sd-scripts 的 `alpha`/rank 因子会自动带上。
+- 分片用 `cp -c`（APFS 写时复制）克隆，只重写每个被打补丁张量的字节区间。
+  safetensors 的 header、张量顺序与数据区对齐逐字节不变，h3.c 直接就能加载
+  折叠后的目录。
+- 每个张量在写入任何字节之前都要过一遍随机探针检查：`folded@x` 必须在 1e-4
+  相对误差内等于 `W@x + factor*(B@(A@x))`。A/B 装反、适配器转置、rank 不匹配
+  都会在这里被拦下。
+- base checkpoint 里找不到的 LoRA 目标默认直接报错（要放过得显式加
+  `--allow-missing`），所以不会不小心做出"折了一半"的 checkpoint。
+
+本机实测验证：把 `minimax_h3_turbo_v4_step600_ema` 的 259 对 adapter 折进
+FL2VA transformer，结果与此前已经烘好的 checkpoint **逐字节相同**（535/535 个
+张量一致），这交叉验证了折叠结果与之前实测过的模型是同一个。
+
+LoRA 只影响 DiT transformer：text encoder、video VAE、audio VAE 都不受影响，
+所以模型目录里这三块可以直接指向原始快照而不必复制。配合 `cp -c`，折好的
+transformer 真实占用 61 MB，而不是 62 GB。
+
+用折好的 Turbo LoRA 采样时：`--steps 5` 或 `6`，**不要**再叠加 `--reuse` 或
+`--core-reuse`——蒸馏调度本身已经把这两者利用的冗余去掉了。4 步会拖影。
+
 ### 测试
 
 新增两个测试二进制，并挂进 `make test`：
