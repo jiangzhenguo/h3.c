@@ -1043,11 +1043,24 @@ python3 tools/merge_lora_h3.py \
 - A LoRA target that is absent from the base checkpoint is a hard error unless
   `--allow-missing` is given, so a half-folded checkpoint cannot be produced
   by accident.
+- Stacking several LoRAs works: run the tool once per LoRA, always with
+  `--src` pointing at the base and `--dst` at the same product directory. The
+  second run patches the already-merged destination in place, so the result is
+  `base + first + second`. `--refresh` re-clones the base first and discards
+  whatever was merged before.
+- Every applied LoRA is recorded in `<dst>/.lora_manifest.json` with its
+  sha256, so applying the same LoRA twice is refused instead of silently
+  doubling the delta. The manifest is a dotfile, so h3.c ignores it.
 
 Verified on this machine: folding the 259 adapter pairs of
 `minimax_h3_turbo_v4_step600_ema` into the FL2VA transformer reproduces the
 already-merged checkpoint **byte for byte** (535/535 tensors identical), which
 is the cross-check that the bake matches the model that was measured before.
+Stacking a style LoRA and the turbo LoRA into one checkpoint was checked the
+same way: the product equals `base + style + turbo` with a maximum absolute
+difference of 0.0 against an independent numpy computation. Each LoRA is
+rounded back to BF16 when it is written, so a two-LoRA stack is
+`bf16(bf16(base + first) + second)`, not `bf16(base + first + second)`.
 
 A LoRA only touches the DiT transformer: the text encoder, the video VAE and
 the audio VAE are unaffected, so a model directory can point those at the

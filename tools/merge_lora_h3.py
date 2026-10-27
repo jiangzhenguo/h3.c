@@ -24,15 +24,31 @@ Usage:
   python3 tools/merge_lora_h3.py --lora LORA.safetensors --src BASE_TRANSFORMER_DIR \
       --dst OUT_TRANSFORMER_DIR [--strength 1.0]
 
-The output keeps the exact shard layout/header of the source (copy + in-place
-patch), so h3.c can load it directly. Base BF16 weights are upcast to F32,
-delta (B@A * alpha/rank * strength) added, then rounded back to BF16 (RNE).
+Stacking several LoRAs into one checkpoint
+------------------------------------------
+Run the tool once per LoRA, always with --src pointing at the *base*
+transformer and --dst at the same product directory:
+
+  merge --lora style.safetensors  --src BASE/transformer --dst OUT/transformer
+  merge --lora turbo.safetensors  --src BASE/transformer --dst OUT/transformer
+
+The second run patches the already-merged destination in place (it reads the
+current destination bytes, not the base), so the result is
+base + style + turbo. --refresh instead re-clones the base shards first and
+discards whatever was merged before.
+
+Every applied LoRA is recorded in OUT/transformer/.lora_manifest.json with its
+sha256, so re-running the same LoRA against the same product is refused
+instead of silently applying the delta twice (double application is what makes
+a baked checkpoint look over-saturated and broken). The manifest is a dotfile
+with a .json suffix, so h3.c ignores it.
 
 Only the transformer is affected by a LoRA: the text encoder, the video VAE
 and the audio VAE are untouched, so a model directory can point those at the
 original snapshot instead of copying them.
 """
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -43,6 +59,8 @@ from pathlib import Path
 
 import numpy as np
 
+MANIFEST_NAME = ".lora_manifest.json"
+
 
 def read_header(f):
     (hlen,) = struct.unpack("<Q", f.read(8))
@@ -50,7 +68,7 @@ def read_header(f):
 
 
 def sdscripts_h3_stem(mod):
-    """Map sd-scripts module spelling to the h3 checkpoint key stem.
+    """Map sd-scripts module spelling to the h3 checkpoint key space.
 
     Ordinary blocks use the first three underscores as separators. The refiner
     namespace and final_layer are literal prefixes and need separate handling.
@@ -71,6 +89,7 @@ def load_lora(path):
     with open(path, "rb") as f:
         hlen, hdr = read_header(f)
         body = 8 + hlen
+
         def tensor(key):
             info = hdr[key]
             s, e = info["data_offsets"]
@@ -121,14 +140,53 @@ def f32_from_bf16(raw):
     return (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
 
 
-def clone_shard(src, dst):
-    """Copy a shard, preferring an APFS clone so the copy costs no real space."""
+def sha256_of(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def manifest_path(dst):
+    return dst / MANIFEST_NAME
+
+
+def load_manifest(dst):
+    path = manifest_path(dst)
+    if not path.exists():
+        return {"version": 1, "applies": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"version": 1, "applies": []}
+    if not isinstance(data, dict) or not isinstance(data.get("applies"), list):
+        return {"version": 1, "applies": []}
+    return data
+
+
+def save_manifest(dst, data):
+    path = manifest_path(dst)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def prepare_shard(src, dst, refresh):
+    """Make dst a usable shard.
+
+    Returns "cloned", "copied" or "stacked". "stacked" means the destination
+    already held a merged shard of the same size: it is kept as is, because the
+    new delta has to be added on top of it, not on top of the base.
+    """
+    if dst.exists() and not refresh and dst.stat().st_size == src.stat().st_size:
+        return "stacked"
     if dst.exists():
         dst.unlink()
     if subprocess.run(["cp", "-c", str(src), str(dst)], capture_output=True).returncode == 0:
-        return True
+        return "cloned"
     shutil.copyfile(src, dst)
-    return False
+    return "copied"
 
 
 def parity_check(w, folded, a, b, factor, tolerance, rng):
@@ -150,9 +208,15 @@ def main():
     ap.add_argument("--src", required=True)
     ap.add_argument("--dst", required=True)
     ap.add_argument("--strength", type=float, default=1.0)
+    ap.add_argument("--refresh", action="store_true",
+                    help="re-clone the base shards first, discarding anything "
+                         "that was merged into the destination before")
     ap.add_argument("--allow-missing", action="store_true",
                     help="warn instead of failing when a LoRA target is absent "
                          "from the base checkpoint")
+    ap.add_argument("--allow-repeat", action="store_true",
+                    help="allow applying the same LoRA again to the same "
+                         "destination (the manifest normally refuses it)")
     ap.add_argument("--no-parity", action="store_true",
                     help="skip the per-tensor parity check")
     ap.add_argument("--parity-tol", type=float, default=1e-4)
@@ -167,6 +231,22 @@ def main():
     print(f"lora targets: {len(targets)} tensors, strength={args.strength}", flush=True)
     if not targets:
         sys.exit("no recognizable LoRA tensors found")
+
+    # The manifest makes a second application of the same LoRA impossible to
+    # do by accident: applying the same delta twice is what turns a baked
+    # checkpoint into an over-saturated one.
+    digest = sha256_of(args.lora)
+    manifest = load_manifest(dst)
+    if not args.refresh and not args.allow_repeat:
+        for entry in manifest.get("applies", []):
+            if entry.get("sha256") == digest:
+                sys.exit(
+                    f"this LoRA was already applied to {dst} (manifest: {manifest_path(dst)}); "
+                    "applying it again would double the delta. Use --refresh to rebuild "
+                    "from --src, or --allow-repeat to force it."
+                )
+    if args.refresh:
+        manifest = {"version": 1, "applies": []}
 
     # pass 1: find which shard holds each target
     shards = sorted(p for p in src.glob("*.safetensors"))
@@ -195,25 +275,26 @@ def main():
 
     rng = np.random.default_rng(0)
     applied = 0
-    cloned = 0
+    counts = {"cloned": 0, "copied": 0, "stacked": 0}
     for sp in shards:
         dp = dst / sp.name
-        if clone_shard(sp, dp):
-            cloned += 1
+        counts[prepare_shard(sp, dp, args.refresh)] += 1
         hlen, hdr = headers[sp.name]
         todo = [k for k in hdr if k in targets]
         if not todo:
             print(f"{sp.name}: 0 patched", flush=True)
             continue
-        with open(sp, "rb") as fsrc, open(dp, "r+b") as fdst:
+        with open(dp, "r+b") as fdst:
             for k in todo:
                 info = hdr[k]
                 s, e = info["data_offsets"]
                 if info["dtype"] != "BF16":
                     print(f"  skip non-bf16 {k} ({info['dtype']})", flush=True)
                     continue
-                fsrc.seek(8 + hlen + s)
-                raw = fsrc.read(e - s)
+                # Read the current destination bytes: on a stacked merge this
+                # is the already-merged weight, not the base one.
+                fdst.seek(8 + hlen + s)
+                raw = fdst.read(e - s)
                 A, B, scale = targets[k]
                 w = f32_from_bf16(raw).reshape(info["shape"])
                 factor = scale * args.strength
@@ -235,8 +316,18 @@ def main():
     for extra in ("config.json", "model.safetensors.index.json"):
         if (src / extra).exists():
             shutil.copyfile(src / extra, dst / extra)
+
+    manifest.setdefault("applies", []).append({
+        "lora": Path(args.lora).name,
+        "sha256": digest,
+        "strength": args.strength,
+        "targets": len(targets),
+        "applied": applied,
+    })
+    save_manifest(dst, manifest)
     print(f"DONE. applied {applied}/{len(targets)} lora tensors -> {dst} "
-          f"({cloned}/{len(shards)} shards copied with an APFS clone)", flush=True)
+          f"({counts['cloned']} cloned, {counts['copied']} copied, "
+          f"{counts['stacked']} stacked)", flush=True)
 
 
 if __name__ == "__main__":

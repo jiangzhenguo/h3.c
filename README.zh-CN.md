@@ -870,10 +870,20 @@ python3 tools/merge_lora_h3.py \
   都会在这里被拦下。
 - base checkpoint 里找不到的 LoRA 目标默认直接报错（要放过得显式加
   `--allow-missing`），所以不会不小心做出"折了一半"的 checkpoint。
+- **可以叠多个 LoRA**：一个 LoRA 跑一次，`--src` 始终指基础模型、`--dst` 始终指同一个
+  产物目录。第二次会就地 patch 已融合的产物，所以结果是 `base + 第一个 + 第二个`。
+  `--refresh` 会先重新克隆基础分片，把之前融进去的丢掉。
+- 每次烤入都会把 LoRA 的 sha256 记进 `<dst>/.lora_manifest.json`，同一个 LoRA 再烤一次
+  会被直接拒绝，而不是把 delta 悄悄叠加两遍。这个 manifest 是点开头的文件，h3.c 不会
+  读它。
 
 本机实测验证：把 `minimax_h3_turbo_v4_step600_ema` 的 259 对 adapter 折进
 FL2VA transformer，结果与此前已经烘好的 checkpoint **逐字节相同**（535/535 个
 张量一致），这交叉验证了折叠结果与之前实测过的模型是同一个。
+双 LoRA 叠加（风格 LoRA + turbo LoRA）也用同样方式复核过：产物与独立 numpy 计算出的
+`base + 风格 + turbo` **最大绝对差 0.0**。注意每个 LoRA 写回时都会 RNE 回 BF16，
+所以两次叠加的结果是 `bf16(bf16(base + 第一个) + 第二个)`，而不是
+`bf16(base + 第一个 + 第二个)`。
 
 LoRA 只影响 DiT transformer：text encoder、video VAE、audio VAE 都不受影响，
 所以模型目录里这三块可以用软链指回原始快照，而不必复制。每对模型这样能省下
