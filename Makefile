@@ -97,6 +97,9 @@ h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 h3_video_vae_tests: tests/test_video_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_vae_tile_batch_bench: tests/bench_vae_tile_batch.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_gpu_bf16_ops_tests: tests/test_gpu_bf16_ops.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

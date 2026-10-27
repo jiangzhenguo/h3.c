@@ -507,6 +507,14 @@ int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim, float scale);
+/* Batched SDPA: `batch` independent sequences of `sequence` rows each, laid
+ * out as [batch][sequence][heads][head_dim].  The video VAE uses it to run
+ * every tile of a frame in a single attention call. */
+int h3_gpu_sdpa_bf16_batch(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                           const h3_gpu_tensor *value, uint32_t batch,
+                           uint32_t sequence, uint32_t heads,
+                           uint32_t head_dim, float scale);
 /* Preserve SDPA's native [head,row,dimension] output for an immediately
  * following layout-aware projection. */
 int h3_gpu_sdpa_bf16_head_major_output(

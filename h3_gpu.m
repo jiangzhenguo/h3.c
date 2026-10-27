@@ -1602,6 +1602,16 @@ int h3_gpu_sdpa_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                        0);
 }
 
+int h3_gpu_sdpa_bf16_batch(h3_gpu *opaque, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                           const h3_gpu_tensor *value, uint32_t batch,
+                           uint32_t sequence, uint32_t heads,
+                           uint32_t head_dim, float scale) {
+    return h3_gpu_sdpa(opaque, output, query, key, value, batch, sequence,
+                       heads, head_dim, scale, H3_GPU_BF16, MPSDataTypeBFloat16,
+                       0, 0);
+}
+
 int h3_gpu_sdpa_bf16_head_major_output(
                      h3_gpu *opaque, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
