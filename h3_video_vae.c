@@ -78,6 +78,10 @@ typedef struct {
     h3_gpu_tensor *quant_scales;
     h3_gpu_tensor *proj_i8;
     h3_gpu_tensor *proj_scales;
+    /* The output projection is the last matmul before the pixels, so its
+     * quantization error is not averaged by anything downstream.  It stays
+     * BF16 unless H3_VAE_INT8_PROJECT=1 asks for it. */
+    int int8_project;
     vae_block blocks[LAYERS];
     h3_gpu_tensor *post_w;
     h3_gpu_tensor *post_b;
@@ -174,6 +178,8 @@ static void vae_apply_precision(vae_context *vae) {
     vae_precision precision = vae_select_precision();
     vae->bf16 = precision != VAE_F32;
     vae->int8 = precision == VAE_INT8;
+    const char *project = getenv("H3_VAE_INT8_PROJECT");
+    vae->int8_project = project && *project && strcmp(project, "0") != 0;
 }
 
 static void vae_check_int8_support(vae_context *vae) {
@@ -839,13 +845,13 @@ static int run_decoder(vae_context *vae, h3_video_vae_progress progress,
     }
     if (!load_output_weights(vae, error, error_size)) return 0;
     OP(h3_gpu_begin(vae->gpu), "begin video VAE output projection");
-    if (vae->int8 &&
+    if (vae->int8 && vae->int8_project &&
         !quantize_weight(vae, &vae->proj_i8, &vae->proj_scales, vae->proj_w,
                          OUTPUT_PATCH, HIDDEN, error, error_size)) return 0;
     OP(vae_layer_norm(vae, vae->norm, vae->hidden,
         vae->norm_out_w, vae->norm_out_b, vae->sequence, HIDDEN, 1e-5f),
        "video VAE output LayerNorm");
-    if (vae->int8) {
+    if (vae->int8 && vae->int8_project) {
         OP(vae_linear_int8(vae, vae->projected, vae->norm, vae->proj_i8,
             vae->proj_scales, vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
            "video VAE output projection (int8)");
@@ -881,7 +887,8 @@ static int load_resident_weights(vae_context *vae,
     }
     for (int index = 0; index < LAYERS; index++)
         if (!quantize_block(vae, index, error, error_size)) return 0;
-    if (!quantize_weight(vae, &vae->proj_i8, &vae->proj_scales, vae->proj_w,
+    if (vae->int8_project &&
+        !quantize_weight(vae, &vae->proj_i8, &vae->proj_scales, vae->proj_w,
                          OUTPUT_PATCH, HIDDEN, error, error_size)) return 0;
     if (!h3_gpu_submit(vae->gpu)) {
         fail(error, error_size, "cannot submit the video VAE INT8 quantization: %s",
@@ -890,7 +897,7 @@ static int load_resident_weights(vae_context *vae,
     }
     /* Only now may the BF16 copies go: the GPU has read them. */
     release_block_bf16_weights(vae);
-    free_tensor(&vae->proj_w);
+    if (vae->int8_project) free_tensor(&vae->proj_w);
     return 1;
 }
 
@@ -937,7 +944,7 @@ static int run_resident_tile(vae_context *vae, char *error,
     OP(vae_layer_norm(vae, vae->norm, vae->hidden,
         vae->norm_out_w, vae->norm_out_b, vae->sequence, HIDDEN, 1e-5f),
        "tiled video VAE output LayerNorm");
-    if (vae->int8) {
+    if (vae->int8 && vae->int8_project) {
         OP(vae_linear_int8(vae, vae->projected, vae->norm, vae->proj_i8,
             vae->proj_scales, vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
            "tiled video VAE output projection (int8)");

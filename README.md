@@ -886,7 +886,7 @@ not perceptibly different, and 304 pixels decodes about 26% less in FP32 and
 about 64% less in BF16, where the fixed per-tile dispatch cost stops being
 negligible next to the smaller matrix multiplies.
 
-### 3. INT8 video VAE decoder: 1.51x faster again, below the codec noise floor
+### 3. INT8 video VAE decoder: 1.48x faster again, far below the codec noise floor
 
 With the tile count pinned, the decoder is compute-bound: the linear layers run
 at 20.5-26.6 TFLOP/s and the MLP is 60% of every block. The only remaining
@@ -895,37 +895,42 @@ reach 31.8-50.4 TFLOP/s on the very same shapes. The DiT already had an int8
 path; the video VAE now uses it.
 
 `H3_VAE_PRECISION=int8` runs the four block projections (qkv, out, ff.w1,
-ff.w2) and the output projection through the INT8 matmul. Norms, RoPE,
-attention, SwiGLU and the residual stream stay BF16, because those are not
-matmuls and quantizing them buys nothing. The weights are quantized once at
-load time (one F32 scale per output channel) and the activations are quantized
-per row on the fly.
+ff.w2) through the INT8 matmul. Norms, RoPE, attention, SwiGLU and the
+residual stream stay BF16, because those are not matmuls and quantizing them
+buys nothing. The weights are quantized once at load time (one F32 scale per
+output channel) and the activations are quantized per row on the fly.
+
+The output projection stays BF16 on purpose. It is the last matmul before the
+pixels, so nothing averages its error: quantizing it as well costs 11.4 dB
+(40.55 dB / 0.8965 SSIM instead of 51.94 dB / 0.9962 SSIM) while saving
+almost no time. `H3_VAE_INT8_PROJECT=1` turns it on for A/B runs.
 
 Measured on 960x544, 124 frames, against the FP32 decoder:
 
 | Metric | FP32 | BF16 | INT8 |
 |---|---:|---:|---:|
-| Video VAE decode | 301.282 s | 83.753 s | 54.851 s |
-| Speedup against FP32 | 1.00x | 3.60x | 5.49x |
-| Speedup against BF16 | - | 1.00x | 1.51x |
+| Video VAE decode | 249.888 s | 84.803 s | 58.716 s |
+| Speedup against FP32 | 1.00x | 2.95x | 4.26x |
+| Speedup against BF16 | - | 1.00x | 1.44x |
 | Peak tensor storage | 9.36 GiB | 4.68 GiB | 6.77 GiB (load) |
-| Relative L2 against the FP32 decoder | - | 0.0048 | 0.0188 |
+| Relative L2 against the FP32 decoder | - | 0.0048 | 0.0170 |
 
-Wall-clock times drift with the thermal state, so the 1.51x is the median of
-three adjacent BF16/INT8 pairs (0.671 / 0.558 / 0.663); the independent
-single run above gives 1.53x.
+Wall-clock times drift with the thermal state, so the 1.48x is the median of
+three adjacent BF16/INT8 pairs (0.764 / 0.611 / 0.677); the independent
+single run above gives 1.44x.
 
-The fidelity cost is smaller than the codec's own:
+The fidelity cost stays far below the codec's own:
 
 | Error source | PSNR | RMSE in 8-bit levels | SSIM |
 |---|---:|---:|---:|
 | The final H.264 encode, against the same FP32 decode | 21.78 dB | 20.764 | 0.7772 |
-| **This INT8 VAE, against the same FP32 decode** | **40.55 dB** | **2.394** | **0.8965** |
+| **This INT8 VAE, against the same FP32 decode** | **51.94 dB** | **0.646** | **0.9962** |
 | The BF16 VAE, for reference | 60.14 dB | 0.251 | 0.9994 |
 
-The INT8 decoder is 18.8 dB below the error the video encoder introduces on
-its own, and its SSIM is higher than the encoder's, so the difference is not
+The INT8 decoder is 30 dB below the error the video encoder introduces on its
+own, and its SSIM is far higher than the encoder's, so the difference is not
 visible in the final MP4.
+
 
 Implementation notes:
 

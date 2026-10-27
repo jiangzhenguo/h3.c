@@ -17,14 +17,19 @@
 | 精度代价可忽略：rel-L2 **0.0048**（VPIPE 自身门槛 0.02），成片 23.05 dB / 0.836，比 h3.c 仅热态不同的自比（20.86 dB / 0.842）还接近 | 见 [对比报告 §3.5](reports/VPIPE-vs-h3c-对比报告.md) |
 | 顺带把 VAE tile 默认值对齐回 checkpoint 的 `vae_tile_size` = **256 px**（原先自动挑成 304 px，等于换了 RoPE 位置编码函数） | 见 [改造报告 §4](reports/h3-vae-bf16-改造报告.md) |
 | 内存敏感场景仍应选 h3.c：峰值内存 22.8 GB vs VPIPE 45.9 GB | 见 [对比报告 §3.5](reports/VPIPE-vs-h3c-对比报告.md) |
+| 之后的第二轮实验：**tile 维度合批是净亏**（慢 13%），VAE 解码是算力瓶颈，唯一剩下的杠杆是降精度 | 见 [tile 合批实验报告](reports/vae-tile-batch-实验报告.md) |
+| 第三轮：**全量 INT8 视频 VAE**，解码再快 **1.48×**（成对中位数），误差比 H.264 编码器自身低 30 dB，最终成片里不可见 | 见 [INT8 实验报告](reports/vae-int8-实验报告.md) |
+| 一个反直觉的细节：**最后的输出投影不能量化**——它是进像素前最后一步，误差没人平均，单独值 11.4 dB | 见 [INT8 实验报告 §2.4](reports/vae-int8-实验报告.md) |
 
-## 对应的代码改动（已合并进本仓库 `main`）
+## 对应的代码改动
 
 | 改动 | 分支 | 提交 |
 |---|---|---|
 | 视频 VAE 的 ViT decoder 走 BF16，用上 MPS 张量核心 | `feature/vae-bf16-nax` | `6d2a715` |
 | VAE 空间 tile 默认固定为 checkpoint 的 256 px | `feature/vae-tile-256-standalone` | `709d0c2` |
 | 合并到 `main` | — | `a417bf6` |
+| tile 合批实验（否定结论，保留微基准与报告） | `261027_jzgBatchTileLinear` | `5c10b4d` |
+| 视频 VAE 全量 INT8 路径（`H3_VAE_PRECISION=int8`） | `261027_jzgBatchTileLinear` | 见 [INT8 实验报告](reports/vae-int8-实验报告.md) |
 
 完整补丁见 [`patch/vae-bf16-full.patch`](patch/vae-bf16-full.patch)（该补丁对应的两个提交已合入
 `main`，此处仅作为存档与 review 依据）。
@@ -38,7 +43,9 @@ docs/vpipe/
 │   ├── VPIPE-vs-h3c-对比报告.md            速度/画质/热降频/画质对照全量报告
 │   ├── h3-vae-bf16-改造报告.md             BF16 改造的根因、方案与全部实测数据
 │   ├── pr-body-bf16.md                    给上游的 BF16 改造 PR 正文
-│   └── pr-body-tile.md                    给上游的 tile-256 PR 正文
+│   ├── pr-body-tile.md                    给上游的 tile-256 PR 正文
+│   ├── vae-tile-batch-实验报告.md         tile 合批实验（否定结论 + 算力瓶颈论证）
+│   └── vae-int8-实验报告.md               全量 INT8 实验（1.48× + 保真度评估）
 ├── scripts/                               复现用脚本与微基准源码
 │   ├── controlled-bench.sh                受控基准（冷却 → VPIPE → 冷却 → h3.c）
 │   ├── controlled-bench-i8off.sh          受控基准 + VPIPE 关 i8_gemm
