@@ -29,7 +29,8 @@
 | VAE 空间 tile 默认固定为 checkpoint 的 256 px | `feature/vae-tile-256-standalone` | `709d0c2` |
 | 合并到 `main` | — | `a417bf6` |
 | tile 合批实验（否定结论，保留微基准与报告） | `261027_jzgBatchTileLinear` | `5c10b4d` |
-| 视频 VAE 全量 INT8 路径（`H3_VAE_PRECISION=int8`） | `261027_jzgBatchTileLinear` | 见 [INT8 实验报告](reports/vae-int8-实验报告.md) |
+| 视频 VAE 全量 INT8 路径（`H3_VAE_PRECISION=int8`） | `261027_jzgBatchTileLinear` | `b0f945f` + `eeeed33` |
+| 基准工具并入仓库（`make h3_vae_bench`） | `261027_jzgBatchTileLinear` | 见 [INT8 实验报告](reports/vae-int8-实验报告.md) |
 
 完整补丁见 [`patch/vae-bf16-full.patch`](patch/vae-bf16-full.patch)（该补丁对应的两个提交已合入
 `main`，此处仅作为存档与 review 依据）。
@@ -54,7 +55,13 @@ docs/vpipe/
 │   ├── bench-f32-304.sh                   数值中性验证轮（强制 f32 + 旧 304 px tile）
 │   ├── compare-psnr.sh                    画质对比（ffmpeg psnr / ssim 滤镜）
 │   ├── sample-thermal.sh                  GPU 时钟/温度采样
-│   └── bench_vae_gemm.c                   FP32 vs BF16 GEMM/SDPA 微基准
+│   ├── bench_vae_gemm.c                   FP32 vs BF16 GEMM/SDPA 微基准
+│   └── int8/                              INT8 实验的复现脚本（见该目录的 README)
+│       ├── vae_bench.c                    解码单个 latent 的基准工具（同 tools/vae_bench.c）
+│       ├── sweep.py / paired.py           批量与成对 A/B
+│       ├── psnr.py / ssim.py / codec_floor.py  画质指标与编码器噪声底线
+│       ├── groupsim.py                    逐行 vs 分组量化的误差模拟
+│       └── e2e_int8.sh                    端到端成片 A/B
 ├── config/
 │   ├── h3-t2v-compare.vpipeline           对比用 VPIPE pipeline（直指本地 bf16 权重）
 │   └── prompt.txt                         Context-IR 五段式提示词
