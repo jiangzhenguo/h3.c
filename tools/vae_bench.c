@@ -56,18 +56,33 @@ int main(int argc, char **argv) {
     const float *latent = (const float *)(blob + 3);
     char error[512];
     double start = now();
-    h3_video_vae_decoder *decoder = h3_video_vae_decoder_load(
-        argv[1], "h3_shaders.metal", h, w, NULL, NULL, error, sizeof(error));
-    if (!decoder) {
-        fprintf(stderr, "load: %s\n", error);
-        return 1;
-    }
-    double loaded = now();
+    /* H3_VAE_BENCH_STREAM=1 replays the decode through the streaming entry
+     * point (the one the CLI uses) instead of the resident decoder.  The two
+     * must agree numerically; this is how that is checked. */
+    int stream = getenv("H3_VAE_BENCH_STREAM") != NULL;
+    h3_video_vae_decoder *decoder = NULL;
     h3_video_frames frames = {0};
-    if (!h3_video_vae_decoder_decode(decoder, latent, t, &frames, error,
-                                     sizeof(error))) {
-        fprintf(stderr, "decode: %s\n", error);
-        return 1;
+    double loaded = start;
+    if (stream) {
+        loaded = now();
+        if (!h3_video_vae_decode(argv[1], "h3_shaders.metal", latent, t, h, w,
+                                  NULL, NULL, &frames, error, sizeof(error))) {
+            fprintf(stderr, "decode: %s\n", error);
+            return 1;
+        }
+    } else {
+        decoder = h3_video_vae_decoder_load(
+            argv[1], "h3_shaders.metal", h, w, NULL, NULL, error, sizeof(error));
+        if (!decoder) {
+            fprintf(stderr, "load: %s\n", error);
+            return 1;
+        }
+        loaded = now();
+        if (!h3_video_vae_decoder_decode(decoder, latent, t, &frames, error,
+                                         sizeof(error))) {
+            fprintf(stderr, "decode: %s\n", error);
+            return 1;
+        }
     }
     double decoded = now();
     size_t values = (size_t)frames.frames * (size_t)frames.height *

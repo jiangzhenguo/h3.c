@@ -1376,6 +1376,26 @@ int h3_video_vae_decoder_preview(h3_video_vae_decoder *decoder,
     return ok;
 }
 
+/* H3_VAE_DUMP_LATENT writes the decoder's input latent to a file in the
+ * vae_bench layout: an int32 (time, height, width) header followed by the
+ * 24 x time x height x width float32 latent, channels first.  It lets the
+ * same latent be replayed through several precision settings. */
+static void dump_latent(const char *path, const float *latent, int latent_time,
+                        int latent_h, int latent_w) {
+    if (!path || !*path) return;
+    FILE *file = fopen(path, "wb");
+    if (!file) {
+        fprintf(stderr, "h3: cannot write the latent dump %s\n", path);
+        return;
+    }
+    int32_t header[3] = {latent_time, latent_h, latent_w};
+    fwrite(header, sizeof(header), 1, file);
+    fwrite(latent, sizeof(float),
+           (size_t)LATENT_CHANNELS * (size_t)latent_time *
+           (size_t)latent_h * (size_t)latent_w, file);
+    fclose(file);
+}
+
 int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
                         const float *normalized_latent, int latent_time,
                         h3_video_frames *output,
@@ -1391,6 +1411,8 @@ int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
     int output_frames = chunks * 17 + 5;
     int pixel_h = decoder->latent_h * SPATIAL_RATIO;
     int pixel_w = decoder->latent_w * SPATIAL_RATIO;
+    dump_latent(getenv("H3_VAE_DUMP_LATENT"), normalized_latent, latent_time,
+                decoder->latent_h, decoder->latent_w);
     size_t frame_elements = (size_t)pixel_h * (size_t)pixel_w * 3;
     size_t output_elements = (size_t)output_frames * frame_elements;
     float *final_rgb = malloc(output_elements * sizeof(*final_rgb));
@@ -1606,6 +1628,8 @@ int h3_video_vae_decode(const char *weight_directory,
         fail(error, error_size, "invalid first-chunk video VAE arguments");
         return 0;
     }
+    dump_latent(getenv("H3_VAE_DUMP_LATENT"), normalized_latent, latent_time,
+                latent_height, latent_width);
     vae_context vae;
     memset(&vae, 0, sizeof(vae));
     vae_apply_precision(&vae);

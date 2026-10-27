@@ -943,6 +943,18 @@ Implementation notes:
 - Devices without the integer tensor cores print a notice and fall back to
   BF16.
 
+End to end, with the same prompt, geometry and seed in adjacent runs, the
+video VAE decode went from 74.538 s to 49.771 s (1.50x) and the whole render
+from 490.99 s to 480.60 s.
+
+A note on method: comparing two rendered videos does **not** measure the
+decoder's precision here. The same binary with the same seed, run twice
+50 minutes apart, produces videos that differ by 18.41 dB -- the generator is
+not reproducible across runs, so the render-to-render difference (17.53 dB
+between the INT8 and BF16 runs) sits at the noise floor of the pipeline.
+Precision numbers in this fork always come from replaying one fixed latent
+through several precision settings, never from comparing two renders.
+
 Full measurements, the failure analysis and the reproduction commands are in
 [`docs/vpipe/reports/vae-int8-实验报告.md`](docs/vpipe/reports/vae-int8-实验报告.md).
 
