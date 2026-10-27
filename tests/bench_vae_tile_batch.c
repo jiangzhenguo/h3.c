@@ -334,6 +334,84 @@ static void run_int8_ab(bench *b) {
                    FFN, HIDDEN);
 }
 
+
+/* Numerical check: does the INT8 path compute the same linear map as the
+ * BF16 path?  A wrong weight layout would show up as a relative error near
+ * one instead of near the quantization noise floor. */
+static void check_int8_layout(bench *b) {
+    uint32_t rows = 128, input_dim = 2048, output_dim = 6144;
+    const char *env = getenv("H3_CHECK_ROWS");
+    if (env) rows = (uint32_t)atoi(env);
+    env = getenv("H3_CHECK_IN");
+    if (env) input_dim = (uint32_t)atoi(env);
+    env = getenv("H3_CHECK_OUT");
+    if (env) output_dim = (uint32_t)atoi(env);
+    /* Non-constant data: a constant weight cannot expose a transposed
+     * weight layout. */
+    size_t input_count = (size_t)rows * input_dim;
+    size_t weight_count = (size_t)output_dim * input_dim;
+    uint16_t *input_raw = malloc(input_count * sizeof(*input_raw));
+    uint16_t *weight_raw = malloc(weight_count * sizeof(*weight_raw));
+    for (size_t i = 0; i < input_count; i++) {
+        float value = (float)((int)(i * 37 % 101) - 50) / 50.0f;
+        input_raw[i] = h3_float_to_bf16(value);
+    }
+    for (size_t i = 0; i < weight_count; i++) {
+        float value = (float)((int)(i * 13 % 97) - 48) / 48.0f;
+        weight_raw[i] = h3_float_to_bf16(value);
+    }
+    h3_gpu_tensor *input = h3_gpu_tensor_new_bf16(b->gpu, input_count);
+    h3_gpu_tensor *weight = h3_gpu_tensor_new_bf16(b->gpu, weight_count);
+    h3_gpu_tensor_write_bf16(input, input_raw, input_count);
+    h3_gpu_tensor_write_bf16(weight, weight_raw, weight_count);
+    free(input_raw); free(weight_raw);
+    h3_gpu_tensor *bias = make_bf16(b->gpu, output_dim, 0.1f);
+    h3_gpu_tensor *bf16_out = h3_gpu_tensor_new_bf16(
+        b->gpu, (size_t)rows * output_dim);
+    h3_gpu_tensor *int8_out = h3_gpu_tensor_new_bf16(
+        b->gpu, (size_t)rows * output_dim);
+    h3_gpu_tensor *weight_i8 = h3_gpu_tensor_new_i8(
+        b->gpu, (size_t)output_dim * input_dim);
+    h3_gpu_tensor *weight_scales = h3_gpu_tensor_new_f32(b->gpu, output_dim);
+    uint32_t padded = (rows + 127u) & ~127u;
+    h3_gpu_tensor *quant_in = h3_gpu_tensor_new_i8(
+        b->gpu, (size_t)padded * input_dim);
+    h3_gpu_tensor *input_scales = h3_gpu_tensor_new_f32(b->gpu, padded);
+    h3_gpu_begin(b->gpu);
+    int ok = h3_gpu_quantize_weight_int8(b->gpu, weight_i8, weight_scales,
+                                          weight, output_dim, input_dim) &&
+             h3_gpu_linear_bf16(b->gpu, bf16_out, input, weight, bias, rows,
+                                input_dim, output_dim) &&
+             h3_gpu_linear_int8_bf16(b->gpu, int8_out, quant_in, input_scales,
+                                     input, weight_i8, weight_scales, rows,
+                                     input_dim, output_dim, 0) &&
+             h3_gpu_bias_bf16_to_bf16(b->gpu, int8_out, int8_out, bias, rows,
+                                      output_dim);
+    h3_gpu_submit(b->gpu);
+    if (!ok) {
+        fprintf(stderr, "int8 layout check failed: %s\n", h3_gpu_error(b->gpu));
+        return;
+    }
+    size_t count = (size_t)rows * output_dim;
+    uint16_t *a = malloc(count * sizeof(*a));
+    uint16_t *c = malloc(count * sizeof(*c));
+    h3_gpu_tensor_read_bf16(bf16_out, a, count);
+    h3_gpu_tensor_read_bf16(int8_out, c, count);
+    double numerator = 0, denominator = 0, worst = 0;
+    for (size_t i = 0; i < count; i++) {
+        double x = h3_bf16_to_float(a[i]), y = h3_bf16_to_float(c[i]);
+        numerator += (x - y) * (x - y);
+        denominator += x * x;
+        double delta = fabs(x - y);
+        if (delta > worst) worst = delta;
+    }
+    printf("int8 vs bf16 linear: rel-L2 %.6f, max |delta| %.6f, "
+           "rms(bf16) %.4f\n",
+           sqrt(numerator / denominator), worst,
+           sqrt(denominator / (double)count));
+    free(a); free(c);
+}
+
 int main(int argc, char **argv) {
     const char *shader = argc > 1 ? argv[1] : "h3_shaders.metal";
     bench b;
@@ -348,6 +426,10 @@ int main(int argc, char **argv) {
         if (!b.small) measure(&b, (op_kind)kind, SEQ * TILES, TILES, 1, 1);
     }
 
+    if (getenv("H3_BENCH_CHECK")) {
+        check_int8_layout(&b);
+        return 0;
+    }
     if (getenv("H3_BENCH_AB")) {
         run_linear_ab(&b);
         return 0;

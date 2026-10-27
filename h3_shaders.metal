@@ -4393,3 +4393,20 @@ kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
     float other = h3_bf16_to_f32(up[gid]);
     output[gid] = h3_f32_to_bf16(value / (1.0f + exp(-value)) * other);
 }
+
+struct bias_args {
+    uint rows;
+    uint width;
+};
+
+/* INT8 video-VAE path: the INT8 matmul writes a BF16 result without the
+ * bias, so the bias is broadcast over the rows and added in BF16. */
+kernel void h3_bias_bf16_to_bf16(device const ushort *input [[buffer(0)]],
+                                 device const ushort *bias [[buffer(1)]],
+                                 device ushort *output [[buffer(2)]],
+                                 constant bias_args &args [[buffer(3)]],
+                                 uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.rows * args.width) return;
+    output[gid] = h3_f32_to_bf16(h3_bf16_to_f32(input[gid]) +
+                                 h3_bf16_to_f32(bias[gid % args.width]));
+}

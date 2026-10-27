@@ -413,6 +413,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_scale_add_bf16", @"h3_video_qkv_rope_bf16",
             @"h3_adaln_f32", @"h3_gate_f32", @"h3_qkv_rope_f32",
             @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_silu_bf16",
+            @"h3_bias_bf16_to_bf16",
             @"h3_rms_norm_bf16", @"h3_adaln_bf16", @"h3_gate_bf16",
             @"h3_rms_inverse_bf16", @"h3_adaln_linear_bf16",
             @"h3_gate_adaln_bf16", @"h3_gate_adaln_bf16_exact_simd",
@@ -1009,6 +1010,7 @@ typedef struct {
     float epsilon;
 } vae_encoder_norm_args;
 typedef struct { uint32_t rows, width; } swiglu_args;
+typedef struct { uint32_t rows, width; } bias_args;
 typedef struct { uint32_t elements, approximate; } gelu_bf16_args;
 typedef struct { uint32_t tokens, vocab_size, width; } embedding_args;
 typedef struct {
@@ -4112,6 +4114,25 @@ int h3_gpu_swiglu_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(fused).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
             [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_bias_bf16_to_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *bias, uint32_t rows,
+                             uint32_t width) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)rows * width;
+    if (!h3_gpu_require_bf16(gpu, input, count, @"bias input") ||
+        !h3_gpu_require_bf16(gpu, output, count, @"bias output") ||
+        !h3_gpu_require_bf16(gpu, bias, width, @"bias values")) return 0;
+    bias_args args = {rows, width};
+    return h3_gpu_dispatch_1d(gpu, @"h3_bias_bf16_to_bf16", (uint32_t)count,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(bias).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
         });
 }
 

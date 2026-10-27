@@ -51,6 +51,16 @@ typedef struct {
     h3_gpu_tensor *w2;
     h3_gpu_tensor *w2_b;
     h3_gpu_tensor *scale2;
+    /* INT8 mirrors of the four matmul weights, one F32 scale per output
+     * channel.  The BF16 copies are released once the mirrors exist. */
+    h3_gpu_tensor *qkv_i8;
+    h3_gpu_tensor *qkv_scales;
+    h3_gpu_tensor *out_i8;
+    h3_gpu_tensor *out_scales;
+    h3_gpu_tensor *w1_i8;
+    h3_gpu_tensor *w1_scales;
+    h3_gpu_tensor *w2_i8;
+    h3_gpu_tensor *w2_scales;
 } vae_block;
 
 typedef struct {
@@ -58,6 +68,16 @@ typedef struct {
     h3_weight_store *weights;
     /* 1 selects the BF16 tensor-core path, 0 keeps the legacy F32 path. */
     int bf16;
+    /* 1 runs the block matmuls through the M5 INT8 tensor-core path.  The
+     * activations stay BF16, so this only changes the four projections of
+     * every transformer block and the output projection. */
+    int int8;
+    /* Scratch for the INT8 path: the activations are quantized per row on
+     * the fly, the weights are quantized once at load time. */
+    h3_gpu_tensor *quant_input;
+    h3_gpu_tensor *quant_scales;
+    h3_gpu_tensor *proj_i8;
+    h3_gpu_tensor *proj_scales;
     vae_block blocks[LAYERS];
     h3_gpu_tensor *post_w;
     h3_gpu_tensor *post_b;
@@ -125,16 +145,43 @@ static void free_tensor(h3_gpu_tensor **tensor) {
 
 /* The decoder runs in BF16 by default so the MPS matmul and SDPA paths can
  * use the Apple tensor cores. H3_VAE_PRECISION=f32 restores the original
- * float32 path for A/B comparisons and regression runs. */
-static int vae_prefers_bf16(void) {
+ * float32 path for A/B comparisons and regression runs, and
+ * H3_VAE_PRECISION=int8 runs the block matmuls through the M5 INT8
+ * tensor-core path. */
+typedef enum {
+    VAE_F32 = 0,
+    VAE_BF16,
+    VAE_INT8
+} vae_precision;
+
+static vae_precision vae_select_precision(void) {
     const char *value = getenv("H3_VAE_PRECISION");
     if (value && *value) {
         if (strcasecmp(value, "f32") == 0 || strcasecmp(value, "fp32") == 0 ||
-            strcasecmp(value, "float32") == 0) return 0;
+            strcasecmp(value, "float32") == 0) return VAE_F32;
+        if (strcasecmp(value, "int8") == 0 || strcasecmp(value, "i8") == 0)
+            return VAE_INT8;
         if (strcasecmp(value, "bf16") == 0 ||
-            strcasecmp(value, "bfloat16") == 0) return 1;
+            strcasecmp(value, "bfloat16") == 0) return VAE_BF16;
     }
-    return 1;
+    return VAE_BF16;
+}
+
+/* Record the requested precision.  The INT8 path needs the M5 integer
+ * tensor-core kernels, so the caller confirms the device supports them
+ * before the weights are quantized. */
+static void vae_apply_precision(vae_context *vae) {
+    vae_precision precision = vae_select_precision();
+    vae->bf16 = precision != VAE_F32;
+    vae->int8 = precision == VAE_INT8;
+}
+
+static void vae_check_int8_support(vae_context *vae) {
+    if (vae->int8 && vae->gpu && !h3_gpu_has_int8_mlp(vae->gpu)) {
+        fprintf(stderr, "h3: INT8 video VAE needs the M5 integer tensor "
+                        "cores, falling back to BF16\n");
+        vae->int8 = 0;
+    }
 }
 
 static h3_gpu_tensor *alloc_activation(vae_context *vae, size_t elements) {
@@ -171,6 +218,24 @@ static int vae_linear(vae_context *vae, h3_gpu_tensor *output,
                            input_dim, output_dim) :
         h3_gpu_linear_f32(vae->gpu, output, input, weight, bias, rows,
                           input_dim, output_dim);
+}
+
+/* INT8 matmul: the activations are quantized per row on the fly and the
+ * weights carry one F32 scale per output channel.  The kernel cannot fold
+ * the bias into the graph, so the bias is broadcast afterwards. */
+static int vae_linear_int8(vae_context *vae, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *weight,
+                           const h3_gpu_tensor *weight_scales,
+                           const h3_gpu_tensor *bias, uint32_t rows,
+                           uint32_t input_dim, uint32_t output_dim) {
+    if (!h3_gpu_linear_int8_bf16(vae->gpu, output, vae->quant_input,
+                                 vae->quant_scales, input, weight,
+                                 weight_scales, rows, input_dim, output_dim,
+                                 0)) return 0;
+    if (!bias) return 1;
+    return h3_gpu_bias_bf16_to_bf16(vae->gpu, output, output, bias, rows,
+                                    output_dim);
 }
 
 static int vae_video_qkv_rope(vae_context *vae, h3_gpu_tensor *query,
@@ -272,6 +337,10 @@ static void free_block(vae_block *block) {
     free_tensor(&block->norm2); free_tensor(&block->w1);
     free_tensor(&block->w1_b); free_tensor(&block->w2);
     free_tensor(&block->w2_b); free_tensor(&block->scale2);
+    free_tensor(&block->qkv_i8); free_tensor(&block->qkv_scales);
+    free_tensor(&block->out_i8); free_tensor(&block->out_scales);
+    free_tensor(&block->w1_i8); free_tensor(&block->w1_scales);
+    free_tensor(&block->w2_i8); free_tensor(&block->w2_scales);
 }
 
 static void cleanup(vae_context *vae) {
@@ -289,6 +358,8 @@ static void cleanup(vae_context *vae) {
     free_tensor(&vae->branch); free_tensor(&vae->ff1);
     free_tensor(&vae->activated); free_tensor(&vae->rope_cos);
     free_tensor(&vae->rope_sin); free_tensor(&vae->projected);
+    free_tensor(&vae->quant_input); free_tensor(&vae->quant_scales);
+    free_tensor(&vae->proj_i8); free_tensor(&vae->proj_scales);
     h3_gpu_free(vae->gpu);
     h3_weight_store_free(vae->weights);
     memset(vae, 0, sizeof(*vae));
@@ -324,6 +395,52 @@ static int load_block(vae_context *vae, int index, char *error,
 #undef F1
 #undef F2
     return 1;
+}
+
+/* Quantize one matmul weight to INT8 with one F32 scale per output channel.
+ * The caller owns the command buffer: the quantization is a GPU pass. */
+static int quantize_weight(vae_context *vae, h3_gpu_tensor **target,
+                           h3_gpu_tensor **scales, h3_gpu_tensor *source,
+                           uint32_t rows, uint32_t columns, char *error,
+                           size_t error_size) {
+    *target = h3_gpu_tensor_new_i8(vae->gpu, (size_t)rows * columns);
+    *scales = h3_gpu_tensor_new_f32(vae->gpu, rows);
+    if (!*target || !*scales ||
+        !h3_gpu_quantize_weight_int8(vae->gpu, *target, *scales, source,
+                                     rows, columns)) {
+        fail(error, error_size, "cannot quantize video VAE weight: %s",
+             h3_gpu_error(vae->gpu));
+        return 0;
+    }
+    return 1;
+}
+
+/* Mirror the four block matmul weights into INT8.  The BF16 copies are
+ * released by release_block_bf16_weights() only after the command buffer
+ * that reads them has been submitted: freeing a buffer the GPU is still
+ * reading leaves the quantization with whatever the freed memory holds. */
+static int quantize_block(vae_context *vae, int index, char *error,
+                          size_t error_size) {
+    vae_block *block = &vae->blocks[index];
+    return quantize_weight(vae, &block->qkv_i8, &block->qkv_scales,
+                            block->qkv_w, INNER * 3, HIDDEN, error,
+                            error_size) &&
+           quantize_weight(vae, &block->out_i8, &block->out_scales,
+                            block->out_w, HIDDEN, INNER, error, error_size) &&
+           quantize_weight(vae, &block->w1_i8, &block->w1_scales,
+                            block->w1, FFN * 2, HIDDEN, error, error_size) &&
+           quantize_weight(vae, &block->w2_i8, &block->w2_scales,
+                            block->w2, HIDDEN, FFN, error, error_size);
+}
+
+/* The INT8 path is the only consumer of the four matmul weights, so the
+ * BF16 copies are dropped once the quantization has been submitted. */
+static void release_block_bf16_weights(vae_context *vae) {
+    for (int index = 0; index < LAYERS; index++) {
+        vae_block *block = &vae->blocks[index];
+        free_tensor(&block->qkv_w); free_tensor(&block->out_w);
+        free_tensor(&block->w1); free_tensor(&block->w2);
+    }
 }
 
 static int load_input_weights(vae_context *vae, char *error,
@@ -570,7 +687,48 @@ static int allocate_activations(vae_context *vae, char *error,
             return 0;
         }
     }
+    if (vae->int8) {
+        /* The INT8 matmul quantizes the activations per row, so the scratch
+         * is padded to the kernel's 128-row granularity.  FFN is the widest
+         * input any INT8 projection consumes. */
+        size_t padded = (sequence + 127u) & ~(size_t)127u;
+        vae->quant_input = h3_gpu_tensor_new_i8(vae->gpu, padded * FFN);
+        vae->quant_scales = h3_gpu_tensor_new_f32(vae->gpu, padded);
+        if (!vae->quant_input || !vae->quant_scales) {
+            fail(error, error_size,
+                 "cannot allocate video VAE INT8 scratch: %s",
+                 h3_gpu_error(vae->gpu));
+            return 0;
+        }
+    }
     return 1;
+}
+
+/* Print the statistics of an activation so the BF16 and INT8 paths can be
+ * compared operator by operator.  H3_VAE_DEBUG_STATS=1 turns it on. */
+static int vae_debug_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("H3_VAE_DEBUG_STATS") ? 1 : 0;
+    return enabled;
+}
+
+static void vae_debug_stats(const char *label, const h3_gpu_tensor *tensor,
+                            size_t count) {
+    if (!vae_debug_enabled()) return;
+    uint16_t *raw = malloc(count * sizeof(*raw));
+    if (!raw) return;
+    if (h3_gpu_tensor_read_bf16(tensor, raw, count)) {
+        double sum = 0, sum2 = 0, mn = 1e30, mx = -1e30;
+        for (size_t i = 0; i < count; i++) {
+            double value = h3_bf16_to_float(raw[i]);
+            sum += value; sum2 += value * value;
+            if (value < mn) mn = value;
+            if (value > mx) mx = value;
+        }
+        fprintf(stderr, "h3: %-18s rms %.6f mean %.6f min %.6f max %.6f\n",
+                label, sqrt(sum2 / (double)count), sum / (double)count, mn, mx);
+    }
+    free(raw);
 }
 
 static int run_block(vae_context *vae, int index, char *error,
@@ -580,30 +738,51 @@ static int run_block(vae_context *vae, int index, char *error,
 #define OP(call, label) do {                                                    \
     if (!gpu_op(vae, (call), error, error_size, label)) return 0;               \
 } while (0)
+#define LINEAR(output, input, matrix, lowp, scales, bias, in_dim, out_dim,     \
+               label) do {                                                       \
+    if (vae->int8) {                                                            \
+        OP(vae_linear_int8(vae, (output), (input), (lowp), (scales), (bias),    \
+            rows, (in_dim), (out_dim)), label " (int8)");                       \
+    } else {                                                                    \
+        OP(vae_linear(vae, (output), (input), (matrix), (bias), rows,           \
+            (in_dim), (out_dim)), label);                                       \
+    }                                                                           \
+} while (0)
     OP(vae_rms_norm(vae, vae->norm, vae->hidden, weight->norm1,
         rows, HIDDEN, 1e-5f), "video VAE attention norm");
-    OP(vae_linear(vae, vae->qkv, vae->norm, weight->qkv_w,
-        weight->qkv_b, rows, HIDDEN, INNER * 3), "video VAE QKV");
+    LINEAR(vae->qkv, vae->norm, weight->qkv_w, weight->qkv_i8,
+        weight->qkv_scales, weight->qkv_b, HIDDEN, INNER * 3, "video VAE QKV");
+    if (index == 0 && vae_debug_enabled()) {
+        /* The readback needs the GPU to have run the block, so the tile's
+         * command buffer is submitted and reopened around the printout. */
+        h3_gpu_submit(vae->gpu);
+        vae_debug_stats("block0 norm", vae->norm, (size_t)rows * HIDDEN);
+        vae_debug_stats("block0 qkv", vae->qkv, (size_t)rows * INNER * 3);
+        h3_gpu_begin(vae->gpu);
+    }
     OP(vae_video_qkv_rope(vae, vae->query, vae->key, vae->value,
         vae->qkv, vae->rope_cos, vae->rope_sin, rows, HEADS, HEAD_DIM,
         ROPE_HALF, 1e-5f), "video VAE QK norm/RoPE");
     OP(vae_sdpa(vae, vae->heads, vae->query, vae->key, vae->value,
         rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
        "video VAE attention");
-    OP(vae_linear(vae, vae->branch, vae->heads, weight->out_w,
-        weight->out_b, rows, INNER, HIDDEN), "video VAE attention output");
+    LINEAR(vae->branch, vae->heads, weight->out_w, weight->out_i8,
+        weight->out_scales, weight->out_b, INNER, HIDDEN,
+        "video VAE attention output");
     OP(vae_scale_add(vae, vae->hidden, vae->hidden, vae->branch,
         weight->scale1, rows, HIDDEN), "video VAE attention residual");
-    OP(vae_rms_norm(vae, vae->norm, vae->hidden, weight->norm2,
-        rows, HIDDEN, 1e-5f), "video VAE MLP norm");
-    OP(vae_linear(vae, vae->ff1, vae->norm, weight->w1,
-        weight->w1_b, rows, HIDDEN, FFN * 2), "video VAE MLP input");
+    OP(vae_rms_norm(vae, vae->norm, vae->hidden, weight->norm2, rows, HIDDEN,
+        1e-5f), "video VAE MLP norm");
+    LINEAR(vae->ff1, vae->norm, weight->w1, weight->w1_i8,
+        weight->w1_scales, weight->w1_b, HIDDEN, FFN * 2,
+        "video VAE MLP input");
     OP(vae_swiglu(vae, vae->activated, vae->ff1, rows, FFN),
        "video VAE SwiGLU");
-    OP(vae_linear(vae, vae->branch, vae->activated, weight->w2,
-        weight->w2_b, rows, FFN, HIDDEN), "video VAE MLP output");
+    LINEAR(vae->branch, vae->activated, weight->w2, weight->w2_i8,
+        weight->w2_scales, weight->w2_b, FFN, HIDDEN, "video VAE MLP output");
     OP(vae_scale_add(vae, vae->hidden, vae->hidden, vae->branch,
         weight->scale2, rows, HIDDEN), "video VAE MLP residual");
+#undef LINEAR
 #undef OP
     return 1;
 }
@@ -651,6 +830,8 @@ static int run_decoder(vae_context *vae, h3_video_vae_progress progress,
     for (int index = 0; index < LAYERS; index++) {
         if (!load_block(vae, index, error, error_size)) return 0;
         OP(h3_gpu_begin(vae->gpu), "begin video VAE transformer block");
+        if (vae->int8 &&
+            !quantize_block(vae, index, error, error_size)) return 0;
         if (!run_block(vae, index, error, error_size)) return 0;
         OP(h3_gpu_submit(vae->gpu), "submit video VAE transformer block");
         free_block(&vae->blocks[index]);
@@ -658,12 +839,21 @@ static int run_decoder(vae_context *vae, h3_video_vae_progress progress,
     }
     if (!load_output_weights(vae, error, error_size)) return 0;
     OP(h3_gpu_begin(vae->gpu), "begin video VAE output projection");
+    if (vae->int8 &&
+        !quantize_weight(vae, &vae->proj_i8, &vae->proj_scales, vae->proj_w,
+                         OUTPUT_PATCH, HIDDEN, error, error_size)) return 0;
     OP(vae_layer_norm(vae, vae->norm, vae->hidden,
         vae->norm_out_w, vae->norm_out_b, vae->sequence, HIDDEN, 1e-5f),
        "video VAE output LayerNorm");
-    OP(vae_linear(vae, vae->projected, vae->norm, vae->proj_w,
-        vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
-       "video VAE output projection");
+    if (vae->int8) {
+        OP(vae_linear_int8(vae, vae->projected, vae->norm, vae->proj_i8,
+            vae->proj_scales, vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
+           "video VAE output projection (int8)");
+    } else {
+        OP(vae_linear(vae, vae->projected, vae->norm, vae->proj_w,
+            vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
+           "video VAE output projection");
+    }
     OP(h3_gpu_submit(vae->gpu), "submit video VAE decoder");
     free_tensor(&vae->norm_out_w); free_tensor(&vae->norm_out_b);
     free_tensor(&vae->proj_w); free_tensor(&vae->proj_b);
@@ -680,7 +870,28 @@ static int load_resident_weights(vae_context *vae,
         if (!load_block(vae, index, error, error_size)) return 0;
         if (progress) progress(index + 1, LAYERS, progress_opaque);
     }
-    return load_output_weights(vae, error, error_size);
+    if (!load_output_weights(vae, error, error_size)) return 0;
+    if (!vae->int8) return 1;
+    /* One command buffer for every weight: the quantization is a one-off load
+     * cost, and a single submission keeps the 36 blocks off the critical
+     * path. */
+    if (!h3_gpu_begin(vae->gpu)) {
+        fail(error, error_size, "cannot start the video VAE INT8 quantization");
+        return 0;
+    }
+    for (int index = 0; index < LAYERS; index++)
+        if (!quantize_block(vae, index, error, error_size)) return 0;
+    if (!quantize_weight(vae, &vae->proj_i8, &vae->proj_scales, vae->proj_w,
+                         OUTPUT_PATCH, HIDDEN, error, error_size)) return 0;
+    if (!h3_gpu_submit(vae->gpu)) {
+        fail(error, error_size, "cannot submit the video VAE INT8 quantization: %s",
+             h3_gpu_error(vae->gpu));
+        return 0;
+    }
+    /* Only now may the BF16 copies go: the GPU has read them. */
+    release_block_bf16_weights(vae);
+    free_tensor(&vae->proj_w);
+    return 1;
 }
 
 /* Tiled decoding keeps every VAE weight resident for the duration of the phase.
@@ -726,9 +937,15 @@ static int run_resident_tile(vae_context *vae, char *error,
     OP(vae_layer_norm(vae, vae->norm, vae->hidden,
         vae->norm_out_w, vae->norm_out_b, vae->sequence, HIDDEN, 1e-5f),
        "tiled video VAE output LayerNorm");
-    OP(vae_linear(vae, vae->projected, vae->norm, vae->proj_w,
-        vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
-       "tiled video VAE output projection");
+    if (vae->int8) {
+        OP(vae_linear_int8(vae, vae->projected, vae->norm, vae->proj_i8,
+            vae->proj_scales, vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
+           "tiled video VAE output projection (int8)");
+    } else {
+        OP(vae_linear(vae, vae->projected, vae->norm, vae->proj_w,
+            vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
+           "tiled video VAE output projection");
+    }
     OP(h3_gpu_submit(vae->gpu), "submit tiled video VAE decoder");
     h3_gpu_tensor_free(zero);
 #undef OP
@@ -1099,7 +1316,7 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
         fprintf(stderr, "h3: resident video VAE tiles %dx%d at %d pixels\n",
                 decoder->x_axis.count, decoder->y_axis.count, tile_pixels);
     vae_context *vae = &decoder->vae;
-    vae->bf16 = vae_prefers_bf16();
+    vae_apply_precision(vae);
     if (ok) {
         vae->latent_h = decoder->y_axis.length / SPATIAL_RATIO;
         vae->latent_w = decoder->x_axis.length / SPATIAL_RATIO;
@@ -1114,6 +1331,7 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
             vae->gpu = h3_gpu_create(shader_source_path, error, error_size);
         if (vae->gpu)
             h3_gpu_profile_set_label(vae->gpu, "resident video VAE decoder");
+        vae_check_int8_support(vae);
         ok = vae->weights && vae->gpu &&
              load_resident_weights(vae, progress, progress_opaque,
                                    error, error_size) &&
@@ -1248,7 +1466,7 @@ static int decode_chunked(const char *weight_directory,
                 x_axis.count, y_axis.count, tile_pixels);
     vae_context vae;
     memset(&vae, 0, sizeof(vae));
-    vae.bf16 = vae_prefers_bf16();
+    vae_apply_precision(&vae);
     vae.latent_h = y_axis.length / SPATIAL_RATIO;
     vae.latent_w = x_axis.length / SPATIAL_RATIO;
     vae.latent_t = CHUNK_LATENT_TIME;
@@ -1260,6 +1478,7 @@ static int decode_chunked(const char *weight_directory,
         vae.gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (vae.gpu)
         h3_gpu_profile_set_label(vae.gpu, "video VAE decoder");
+    vae_check_int8_support(&vae);
     ok = vae.weights && vae.gpu &&
          load_resident_weights(&vae, progress, progress_opaque,
                                error, error_size) &&
@@ -1382,7 +1601,7 @@ int h3_video_vae_decode(const char *weight_directory,
     }
     vae_context vae;
     memset(&vae, 0, sizeof(vae));
-    vae.bf16 = vae_prefers_bf16();
+    vae_apply_precision(&vae);
     vae.latent_h = latent_height;
     vae.latent_w = latent_width;
     vae.latent_t = latent_time;
@@ -1417,6 +1636,7 @@ int h3_video_vae_decode(const char *weight_directory,
     vae.gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (vae.gpu)
         h3_gpu_profile_set_label(vae.gpu, "video VAE decoder");
+    vae_check_int8_support(&vae);
     int ok = vae.gpu &&
         load_input_weights(&vae, error, error_size) &&
         prepare_input(&vae, normalized_latent, latent_mean, latent_std,

@@ -815,8 +815,8 @@ Qwen encoder, and decoders never have to coexist in unified memory.
 
 ## Optimizations in this fork (local work)
 
-This fork adds two local optimizations to the video VAE decoder, together with
-the measurement work that motivated them. The full archive -- reports,
+This fork adds three local optimizations to the video VAE decoder, together
+with the measurement work that motivated them. The full archive -- reports,
 reproduction scripts, raw logs, the patch and the rendered media -- lives in
 [`docs/vpipe/`](docs/vpipe/).
 
@@ -886,11 +886,66 @@ not perceptibly different, and 304 pixels decodes about 26% less in FP32 and
 about 64% less in BF16, where the fixed per-tile dispatch cost stops being
 negligible next to the smaller matrix multiplies.
 
+### 3. INT8 video VAE decoder: 1.51x faster again, below the codec noise floor
+
+With the tile count pinned, the decoder is compute-bound: the linear layers run
+at 20.5-26.6 TFLOP/s and the MLP is 60% of every block. The only remaining
+constant factor is the width of each multiply, and the M5 integer tensor cores
+reach 31.8-50.4 TFLOP/s on the very same shapes. The DiT already had an int8
+path; the video VAE now uses it.
+
+`H3_VAE_PRECISION=int8` runs the four block projections (qkv, out, ff.w1,
+ff.w2) and the output projection through the INT8 matmul. Norms, RoPE,
+attention, SwiGLU and the residual stream stay BF16, because those are not
+matmuls and quantizing them buys nothing. The weights are quantized once at
+load time (one F32 scale per output channel) and the activations are quantized
+per row on the fly.
+
+Measured on 960x544, 124 frames, against the FP32 decoder:
+
+| Metric | FP32 | BF16 | INT8 |
+|---|---:|---:|---:|
+| Video VAE decode | 301.282 s | 83.753 s | 54.851 s |
+| Speedup against FP32 | 1.00x | 3.60x | 5.49x |
+| Speedup against BF16 | - | 1.00x | 1.51x |
+| Peak tensor storage | 9.36 GiB | 4.68 GiB | 6.77 GiB (load) |
+| Relative L2 against the FP32 decoder | - | 0.0048 | 0.0188 |
+
+Wall-clock times drift with the thermal state, so the 1.51x is the median of
+three adjacent BF16/INT8 pairs (0.671 / 0.558 / 0.663); the independent
+single run above gives 1.53x.
+
+The fidelity cost is smaller than the codec's own:
+
+| Error source | PSNR | RMSE in 8-bit levels | SSIM |
+|---|---:|---:|---:|
+| The final H.264 encode, against the same FP32 decode | 21.78 dB | 20.764 | 0.7772 |
+| **This INT8 VAE, against the same FP32 decode** | **40.55 dB** | **2.394** | **0.8965** |
+| The BF16 VAE, for reference | 60.14 dB | 0.251 | 0.9994 |
+
+The INT8 decoder is 18.8 dB below the error the video encoder introduces on
+its own, and its SSIM is higher than the encoder's, so the difference is not
+visible in the final MP4.
+
+Implementation notes:
+
+- The INT8 matmul has no bias epilogue, so a new `h3_bias_bf16_to_bf16` Metal
+  kernel broadcasts the bias over the rows in place.
+- The BF16 weight copies are released only after the quantization command
+  buffer has been submitted. Releasing them earlier leaves the GPU reading
+  freed memory, which quantizes the weights to zero and collapses the decode
+  to a constant image.
+- Devices without the integer tensor cores print a notice and fall back to
+  BF16.
+
+Full measurements, the failure analysis and the reproduction commands are in
+[`docs/vpipe/reports/vae-int8-实验报告.md`](docs/vpipe/reports/vae-int8-实验报告.md).
+
 ### Tests
 
 Two test binaries were added and wired into `make test`:
 
-- `tests/test_video_vae.c` (`h3_video_vae_tests`) compares F32 and BF16
+- `tests/test_video_vae.c` (`h3_video_vae_tests`) compares F32, BF16 and INT8
   decodes: wall time, relative L2, max and mean absolute error, RGB range,
   frame count and resolution, across several tile sizes, plus a load benchmark.
 - `tests/test_gpu_bf16_ops.c` (`h3_gpu_bf16_ops_tests`) validates the two new

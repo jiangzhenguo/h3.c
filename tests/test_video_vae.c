@@ -62,6 +62,7 @@ typedef struct {
     int tile_pixels;
     decode_result f32;
     decode_result bf16;
+    decode_result int8;
 } tile_result;
 
 static int latent_time = DEFAULT_LATENT_TIME;
@@ -227,10 +228,16 @@ static int decode_tile(const char *weights, const char *shader, int tile_pixels,
         die("the float32 video VAE decode failed");
     if (!decode_with(weights, shader, "bf16", tile_pixels, latent, &out->bf16))
         die("the BF16 video VAE decode failed");
+    if (!decode_with(weights, shader, "int8", tile_pixels, latent, &out->int8))
+        die("the INT8 video VAE decode failed");
     if (out->f32.frames != out->bf16.frames ||
         out->f32.height != out->bf16.height ||
         out->f32.width != out->bf16.width)
         die("the float32 and BF16 decodes disagree on the output shape");
+    if (out->f32.frames != out->int8.frames ||
+        out->f32.height != out->int8.height ||
+        out->f32.width != out->int8.width)
+        die("the float32 and INT8 decodes disagree on the output shape");
     if (out->f32.frames < 1 || out->f32.height < 1 || out->f32.width < 1)
         die("the video VAE produced an empty frame");
     if (out->f32.height != latent_height * SPATIAL_RATIO ||
@@ -261,9 +268,19 @@ static void print_tile(const tile_result *tile) {
            tile->bf16.gpu_seconds, tile->bf16.mps_linears,
            tile->bf16.mps_sdpa,
            (double)tile->bf16.peak_live_bytes / (1024.0 * 1024.0 * 1024.0));
+    printf("  INT8: load %7.3f s, decode %7.3f s, GPU %7.3f s, "
+           "%llu MPS linears, %llu MPS SDPA, peak %.2f GiB\n",
+           tile->int8.load_seconds, tile->int8.decode_seconds,
+           tile->int8.gpu_seconds, tile->int8.mps_linears,
+           tile->int8.mps_sdpa,
+           (double)tile->int8.peak_live_bytes / (1024.0 * 1024.0 * 1024.0));
     if (tile->bf16.decode_seconds > 0.0)
         printf("  BF16 decode speedup: %.2fx\n",
                tile->f32.decode_seconds / tile->bf16.decode_seconds);
+    if (tile->int8.decode_seconds > 0.0)
+        printf("  INT8 decode speedup: %.2fx over F32, %.2fx over BF16\n",
+               tile->f32.decode_seconds / tile->int8.decode_seconds,
+               tile->bf16.decode_seconds / tile->int8.decode_seconds);
 }
 
 int main(int argc, char **argv) {
@@ -327,6 +344,21 @@ int main(int argc, char **argv) {
         printf("  RGB range: F32 [%.6g, %.6g], BF16 [%.6g, %.6g]\n",
                precision.reference_min, precision.reference_max,
                precision.other_min, precision.other_max);
+        comparison lowp;
+        if (!compare(&tile.f32, &tile.int8, &lowp))
+            die("the float32 and INT8 decodes produced different pixel counts");
+        print_delta("INT8 vs F32:", &lowp);
+        printf("  RGB range: INT8 [%.6g, %.6g]\n", lowp.other_min,
+               lowp.other_max);
+        if (lowp.rel_l2 > 0.05) {
+            fprintf(stderr, "h3: the INT8 decoder exceeds the rel-L2 0.05 "
+                            "bound (%.6g)\n", lowp.rel_l2);
+            ok = 0;
+        }
+        if (lowp.other_min < -1e-6 || lowp.other_max > 1.0 + 1e-6) {
+            fprintf(stderr, "h3: the INT8 decoder left the [0,1] RGB range\n");
+            ok = 0;
+        }
         if (precision.rel_l2 > 0.01) {
             fprintf(stderr, "h3: the BF16 decoder exceeds the rel-L2 0.01 "
                             "bound (%.6g)\n", precision.rel_l2);
@@ -356,10 +388,12 @@ int main(int argc, char **argv) {
         }
         free(tile.f32.rgb);
         free(tile.bf16.rgb);
+        free(tile.int8.rgb);
     }
     if (baseline.f32.rgb) {
         free(baseline.f32.rgb);
         free(baseline.bf16.rgb);
+        free(baseline.int8.rgb);
     }
     free(latent);
     if (!ok) exit(1);

@@ -525,6 +525,12 @@ int h3_gpu_sdpa_bf16_head_major_output(
 int h3_gpu_swiglu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                        const h3_gpu_tensor *fused, uint32_t rows,
                        uint32_t width);
+/* Broadcast a BF16 bias over the rows of a BF16 matrix.  The INT8 matmul
+ * cannot fold the bias into the graph, so the video VAE adds it afterwards. */
+int h3_gpu_bias_bf16_to_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *bias, uint32_t rows,
+                             uint32_t width);
 int h3_gpu_embedding_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                           const h3_gpu_tensor *weight,
                           const h3_gpu_tensor *token_ids, uint32_t tokens,
