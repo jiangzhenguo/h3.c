@@ -511,6 +511,32 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
             return 0;
         }
     }
+    if ((params->second_pass_width == 0) != (params->second_pass_height == 0)) {
+        h3_set_error(ctx,
+            "second-pass width and height must be set together");
+        return 0;
+    }
+    if (params->second_pass_width) {
+        if (!(params->second_pass_denoise > 0.0 &&
+              params->second_pass_denoise < 1.0)) {
+            h3_set_error(ctx,
+                "a second-pass canvas needs a fraction in (0, 1)");
+            return 0;
+        }
+        if (params->second_pass_width < 32 ||
+            params->second_pass_height < 32 ||
+            params->second_pass_width % H3_CANVAS_MULTIPLE ||
+            params->second_pass_height % H3_CANVAS_MULTIPLE ||
+            params->second_pass_width > params->width ||
+            params->second_pass_height > params->height ||
+            (int64_t)params->second_pass_width * params->height !=
+                (int64_t)params->second_pass_height * params->width) {
+            h3_set_error(ctx,
+                "second-pass canvas must be a same-aspect multiple of 32 no "
+                "larger than the output canvas");
+            return 0;
+        }
+    }
     int aligned_frames = h3_align_frame_count(params->frames);
     if (params->frames < 5 || !aligned_frames || aligned_frames > 362) {
         h3_set_error(ctx, "frames must align within the released 5..362 range");
@@ -660,6 +686,12 @@ static void h3_text_progress_bridge(int completed, int total, void *opaque) {
 static void h3_dit_progress_bridge(const char *phase, int completed, int total,
                                    void *opaque) {
     h3_progress_emit(opaque, phase, completed, total);
+}
+
+static void h3_second_pass_progress_bridge(const char *phase, int completed,
+                                           int total, void *opaque) {
+    (void)phase;
+    h3_progress_emit(opaque, "second pass", completed, total);
 }
 
 static void h3_vae_progress_bridge(int completed, int total, void *opaque) {
@@ -846,8 +878,89 @@ static float *h3_extract_vision_pair(const float *pixels, int frames,
     return pair;
 }
 
+/* Re-noise a clean latent back to the requested point of the released grid:
+ * x = (1 - sigma) * x0 + sigma * noise. A second pass uses a fresh generator
+ * so the first pass stays bit-reproducible. */
+static int h3_mix_noise(float *values, size_t count, float sigma,
+                        uint64_t seed) {
+    float *noise = malloc(count * sizeof(*noise));
+    if (!noise) return 0;
+    h3_rng rng;
+    h3_rng_seed(&rng, seed);
+    h3_rng_fill_normal(&rng, noise, count);
+    for (size_t index = 0; index < count; index++)
+        values[index] = (1.0f - sigma) * values[index] + sigma * noise[index];
+    free(noise);
+    return 1;
+}
+
+/* Latent-space bridge between the two passes: bilinear up-sample every
+ * (channel, time) plane of the first-pass latent onto the second canvas. The
+ * temporal axis is unchanged, so the released VAE's chunked latent grid stays
+ * intact, and the second pass regenerates the high-frequency detail. */
+static int h3_upscale_latent(const float *input, int channels, int time,
+                             int in_h, int in_w, int out_h, int out_w,
+                             float **output) {
+    *output = NULL;
+    if (!input || channels < 1 || time < 1 || in_h < 1 || in_w < 1 ||
+        out_h < 1 || out_w < 1) return 0;
+    size_t in_plane = (size_t)in_h * (size_t)in_w;
+    size_t out_plane = (size_t)out_h * (size_t)out_w;
+    size_t planes = (size_t)channels * (size_t)time;
+    if (in_plane > SIZE_MAX / planes ||
+        out_plane > SIZE_MAX / planes ||
+        planes * out_plane > SIZE_MAX / sizeof(float)) return 0;
+    float *values = malloc(planes * out_plane * sizeof(*values));
+    if (!values) return 0;
+    for (size_t plane = 0; plane < planes; plane++) {
+        const float *src = input + plane * in_plane;
+        float *dst = values + plane * out_plane;
+        for (int y = 0; y < out_h; y++) {
+            float sy = ((float)y + 0.5f) * (float)in_h / (float)out_h - 0.5f;
+            if (sy < 0.0f) sy = 0.0f;
+            int y0 = (int)sy;
+            if (y0 > in_h - 1) y0 = in_h - 1;
+            int y1 = y0 + 1 < in_h ? y0 + 1 : in_h - 1;
+            float wy = sy - (float)y0;
+            if (wy < 0.0f) wy = 0.0f;
+            for (int x = 0; x < out_w; x++) {
+                float sx = ((float)x + 0.5f) * (float)in_w / (float)out_w -
+                           0.5f;
+                if (sx < 0.0f) sx = 0.0f;
+                int x0 = (int)sx;
+                if (x0 > in_w - 1) x0 = in_w - 1;
+                int x1 = x0 + 1 < in_w ? x0 + 1 : in_w - 1;
+                float wx = sx - (float)x0;
+                if (wx < 0.0f) wx = 0.0f;
+                float top = src[(size_t)y0 * in_w + x0] * (1.0f - wx) +
+                            src[(size_t)y0 * in_w + x1] * wx;
+                float bottom = src[(size_t)y1 * in_w + x0] * (1.0f - wx) +
+                               src[(size_t)y1 * in_w + x1] * wx;
+                dst[(size_t)y * out_w + x] =
+                    top * (1.0f - wy) + bottom * wy;
+            }
+        }
+    }
+    *output = values;
+    return 1;
+}
+
+static h3_result *h3_generate_pass(h3_ctx *ctx, const char *prompt,
+                                   const h3_params *params,
+                                   const float *initial_video,
+                                   const float *initial_audio,
+                                   int initial_step);
+
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params) {
+    return h3_generate_pass(ctx, prompt, params, NULL, NULL, 0);
+}
+
+static h3_result *h3_generate_pass(h3_ctx *ctx, const char *prompt,
+                                   const h3_params *params,
+                                   const float *initial_video,
+                                   const float *initial_audio,
+                                   int initial_step) {
     if (!ctx) return NULL;
     ctx->error[0] = '\0';
     if (!prompt || !*prompt) {
@@ -865,6 +978,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         return NULL;
     }
     int ref2va = params->reference_count != 0;
+    int second_pass = 0;
+    int second_pass_canvas = 0;
+    int is_second_pass = initial_video != NULL && initial_audio != NULL;
     if (ref2va && !ctx->model.ref2va_transformer.files) {
         h3_set_error(ctx, "ordered references require the Ref2VA checkpoint");
         return NULL;
@@ -1426,6 +1542,16 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
     }
     conditioned = visual_count != 0 || condition_audio_elements != 0;
+    /* A second pass re-denoises the tail of the same released sigma grid. The
+     * condition rows must survive until that pass finishes. */
+    second_pass = !is_second_pass && params->second_pass_denoise > 0.0 &&
+                  params->second_pass_denoise < 1.0;
+    second_pass_canvas = second_pass && params->second_pass_width > 0 &&
+                         params->second_pass_height > 0;
+    if (second_pass_canvas && params->second_pass_denoise < 0.35)
+        fprintf(stderr, "h3: warning: a canvas second pass below 0.35 can "
+                        "keep latent up-sampling ghosts; 0.4 or more removes "
+                        "them\n");
     if (ctx->cache_enabled) {
         if (!h3_conditioning_cache_store(
                 ctx, conditioning_key, &text,
@@ -1532,10 +1658,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
     }
     h3_text_embedding_free(&text);
-    free(condition_video_rows);
-    condition_video_rows = NULL;
-    free(condition_audio_rows);
-    condition_audio_rows = NULL;
+    if (!second_pass) {
+        free(condition_video_rows);
+        condition_video_rows = NULL;
+        free(condition_audio_rows);
+        condition_audio_rows = NULL;
+    }
     if (progress.cancelled) goto cleanup;
     if (params->preview_denoise) {
         h3_progress_emit(&progress, "preview VAE load", 0, 36);
@@ -1567,16 +1695,40 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "out of memory allocating joint H3 noise");
         goto cleanup;
     }
-    /* The released server initializes each modality from a separate generator
-     * carrying the same requested seed. */
-    h3_rng video_rng, audio_rng;
-    h3_rng_seed(&video_rng, params->seed);
-    h3_rng_seed(&audio_rng, params->seed);
-    h3_rng_fill_normal(&video_rng, video, video_count);
-    h3_rng_fill_normal(&audio_rng, audio, audio_count);
-    if (!h3_dit_denoise_euler_preview(
-            dit, video, audio, params->denoise_reuse,
-            h3_dit_progress_bridge, &progress,
+    int denoise_start_step = 0;
+    if (is_second_pass) {
+        if (initial_step < 1 || initial_step >= sigmas.steps) {
+            h3_set_error(ctx,
+                "second-pass start step is outside the released sigma grid");
+            goto cleanup;
+        }
+        denoise_start_step = initial_step;
+        memcpy(video, initial_video, video_count * sizeof(*video));
+        memcpy(audio, initial_audio, audio_count * sizeof(*audio));
+        uint64_t second_seed = params->second_pass_seed < 0
+            ? params->seed + 1 : (uint64_t)params->second_pass_seed;
+        if (!h3_mix_noise(video, video_count,
+                          sigmas.video[denoise_start_step], second_seed) ||
+            !h3_mix_noise(audio, audio_count,
+                          sigmas.audio[denoise_start_step], second_seed)) {
+            h3_set_error(ctx,
+                "out of memory re-noising the second-pass latents");
+            goto cleanup;
+        }
+    } else {
+        /* The released server initializes each modality from a separate
+         * generator carrying the same requested seed. */
+        h3_rng video_rng, audio_rng;
+        h3_rng_seed(&video_rng, params->seed);
+        h3_rng_seed(&audio_rng, params->seed);
+        h3_rng_fill_normal(&video_rng, video, video_count);
+        h3_rng_fill_normal(&audio_rng, audio, audio_count);
+    }
+    if (!h3_dit_denoise_euler_from(
+            dit, video, audio, denoise_start_step, params->denoise_reuse,
+            is_second_pass ? h3_second_pass_progress_bridge
+                           : h3_dit_progress_bridge,
+            &progress,
             preview_decoder ? h3_deliver_denoise_preview : NULL,
             preview_decoder ? &live_preview : NULL,
             detail, sizeof(detail))) {
@@ -1588,6 +1740,110 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             dit_is_cached = 0;
         }
         goto cleanup;
+    }
+    if (second_pass_canvas && sigmas.steps >= 2 && video && audio) {
+        /* Hires pass: bridge the first-pass latent into the second canvas,
+         * release the first-pass transformer, then run a full pipeline pass
+         * that re-encodes the text and every condition at that canvas. */
+        int start_step = (int)llround((double)sigmas.steps *
+                                      (1.0 - params->second_pass_denoise));
+        if (start_step < 1) start_step = 1;
+        if (start_step > sigmas.steps - 1) start_step = sigmas.steps - 1;
+        if (dit_is_cached) {
+            ctx->dit = NULL;
+            free(ctx->dit_key);
+            ctx->dit_key = NULL;
+            dit_is_cached = 0;
+        } else {
+            h3_dit_free(dit);
+        }
+        dit = NULL;
+        free(condition_video_rows);
+        condition_video_rows = NULL;
+        free(condition_audio_rows);
+        condition_audio_rows = NULL;
+        int target_w = 0, target_h = 0;
+        h3_latent_canvas(params->second_pass_width,
+                         params->second_pass_height, &target_w, &target_h);
+        h3_progress_emit(&progress, "second pass prepare", 0, 1);
+        float *init_video = NULL;
+        if (!h3_upscale_latent(video, 24, temporal.video_t, latent_h, latent_w,
+                               target_h, target_w, &init_video)) {
+            h3_set_error(ctx,
+                "out of memory up-scaling the first-pass latent");
+            goto cleanup;
+        }
+        h3_progress_emit(&progress, "second pass prepare", 1, 1);
+        float *init_audio = malloc(audio_count * sizeof(*init_audio));
+        if (!init_audio) {
+            free(init_video);
+            h3_set_error(ctx,
+                "out of memory copying the second-pass audio latent");
+            goto cleanup;
+        }
+        memcpy(init_audio, audio, audio_count * sizeof(*init_audio));
+        free(video);
+        video = NULL;
+        free(audio);
+        audio = NULL;
+        h3_params nested = *params;
+        nested.render_width = params->second_pass_width;
+        nested.render_height = params->second_pass_height;
+        nested.second_pass_width = 0;
+        nested.second_pass_height = 0;
+        nested.second_pass_denoise = 0.0;
+        nested.preview_denoise = 0;
+        result = h3_generate_pass(ctx, prompt, &nested, init_video,
+                                  init_audio, start_step);
+        free(init_video);
+        free(init_audio);
+        goto cleanup;
+    }
+    /* In-place second pass: re-noise the clean latent to the requested point
+     * on the same sigma grid and run only the remaining Euler steps. This is
+     * the released-grid equivalent of an img2img refinement pass. */
+    if (second_pass && sigmas.steps >= 2 && video && audio) {
+        int start_step = (int)llround((double)sigmas.steps *
+                                      (1.0 - params->second_pass_denoise));
+        if (start_step < 1) start_step = 1;
+        if (start_step > sigmas.steps - 1) start_step = sigmas.steps - 1;
+        uint64_t second_seed = params->second_pass_seed < 0
+            ? params->seed + 1 : (uint64_t)params->second_pass_seed;
+        if (!h3_mix_noise(video, video_count, sigmas.video[start_step],
+                          second_seed) ||
+            !h3_mix_noise(audio, audio_count, sigmas.audio[start_step],
+                          second_seed)) {
+            h3_set_error(ctx,
+                "out of memory re-noising the second-pass latents");
+            goto cleanup;
+        }
+        if (!h3_dit_reset_run(dit, condition_video_rows,
+                              condition_video_elements,
+                              condition_audio_rows,
+                              condition_audio_elements,
+                              detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        if (!h3_dit_denoise_euler_from(
+                dit, video, audio, start_step, params->denoise_reuse,
+                h3_second_pass_progress_bridge, &progress,
+                preview_decoder ? h3_deliver_denoise_preview : NULL,
+                preview_decoder ? &live_preview : NULL,
+                detail, sizeof(detail))) {
+            if (!live_preview.failed) h3_set_error(ctx, "%s", detail);
+            if (dit_is_cached) {
+                ctx->dit = NULL;
+                free(ctx->dit_key);
+                ctx->dit_key = NULL;
+                dit_is_cached = 0;
+            }
+            goto cleanup;
+        }
+        free(condition_video_rows);
+        condition_video_rows = NULL;
+        free(condition_audio_rows);
+        condition_audio_rows = NULL;
     }
     if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;

@@ -126,12 +126,26 @@ typedef struct {
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
     void *callback_opaque;
+    /* Optional second denoising pass over the tail of the released sigma grid.
+     * The value is the fraction of the grid to re-denoise in place: the final
+     * latent is re-noised to that point and the remaining Euler steps run
+     * again. 0 disables the pass; values outside (0, 1) are ignored. */
+    double second_pass_denoise;
+    /* Noise seed for the second pass. A negative value derives seed + 1. */
+    int64_t second_pass_seed;
+    /* Optional second-pass canvas. When both are non-zero, together with
+     * second_pass_denoise, the first pass runs on the internal render canvas,
+     * its frames are up-sampled and re-encoded at this canvas, and a second
+     * full pipeline pass runs here with every condition re-encoded at the new
+     * canvas. Zero keeps the second pass on the first-pass canvas. */
+    int second_pass_width;
+    int second_pass_height;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
+    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, 0.0, -1, 0, 0 \
 }
 
 typedef struct {

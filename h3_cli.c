@@ -157,6 +157,8 @@ static void print_help(void) {
     puts("  !seconds [N]             Set duration at 24 fps");
     puts("  !steps [N]               Set or show denoising steps");
     puts("  !reuse [N]               Set or show denoiser reuse");
+    puts("  !second-pass [F|off]     Set or show the second-pass fraction");
+    puts("  !second-pass-canvas [WxH|native]  Set or show the second-pass canvas");
     puts("  !layers [N]              Set or show active DiT blocks");
     puts("  !core-reuse [N]          Set or show core reuse");
     puts("  !token-reduction [on|off]  Toggle token reduction");
@@ -196,6 +198,14 @@ static void print_status(const h3_cli_state *state) {
            state->params.ssd_streaming ? "SSD BF16" : "resident",
            state->params.ssd_streaming ? "BF16" :
            state->params.use_int8_row_fc2 ? "int8 row" : "int8 grouped");
+    if (state->params.second_pass_denoise > 0.0)
+        printf("Second pass: %.2f\n", state->params.second_pass_denoise);
+    else
+        puts("Second pass: off");
+    if (state->params.second_pass_width)
+        printf("Second-pass canvas: %dx%d\n",
+               state->params.second_pass_width,
+               state->params.second_pass_height);
     printf("Spatial RoPE: %s\n", state->params.use_reference_rope ?
            "released reference" : "native 256 adapted");
     if (state->random_seed) puts("Seed: random");
@@ -572,6 +582,55 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         set_integer(argument, "Steps", 1, H3_MAX_STEPS, &state->params.steps);
     } else if (!strcasecmp(command, "reuse")) {
         set_integer(argument, "Reuse", 1, 32, &state->params.denoise_reuse);
+    } else if (!strcasecmp(command, "second-pass")) {
+        if (!*argument) {
+            if (state->params.second_pass_denoise > 0.0)
+                printf("Second pass: %.2f\n",
+                       state->params.second_pass_denoise);
+            else
+                puts("Second pass: off");
+        } else if (!strcasecmp(argument, "off") ||
+                   !strcasecmp(argument, "none")) {
+            state->params.second_pass_denoise = 0.0;
+            puts("Second pass: off");
+        } else {
+            char *end = NULL;
+            errno = 0;
+            double value = strtod(argument, &end);
+            while (end && isspace((unsigned char)*end)) end++;
+            if (errno || end == argument || !end || *end ||
+                !isfinite(value) || value <= 0.0 || value >= 1.0) {
+                fprintf(stderr,
+                        "h3: second pass fraction must be in (0, 1)\n");
+            } else {
+                state->params.second_pass_denoise = value;
+                printf("Second pass: %.2f\n", value);
+            }
+        }
+    } else if (!strcasecmp(command, "second-pass-canvas")) {
+        if (!*argument) {
+            if (state->params.second_pass_width)
+                printf("Second-pass canvas: %dx%d\n",
+                       state->params.second_pass_width,
+                       state->params.second_pass_height);
+            else
+                puts("Second-pass canvas: off");
+        } else if (!strcasecmp(argument, "native") ||
+                   !strcasecmp(argument, "off")) {
+            state->params.second_pass_width = 0;
+            state->params.second_pass_height = 0;
+            puts("Second-pass canvas: off");
+        } else {
+            int width, height;
+            if (!parse_size(argument, &width, &height))
+                fprintf(stderr,
+                        "h3: second-pass canvas must be WxH or native\n");
+            else {
+                state->params.second_pass_width = width;
+                state->params.second_pass_height = height;
+                printf("Second-pass canvas: %dx%d\n", width, height);
+            }
+        }
     } else if (!strcasecmp(command, "layers")) {
         set_integer(argument, "Layers", H3_MIN_DIT_LAYERS,
                     H3_DEFAULT_DIT_LAYERS, &state->params.dit_layers);

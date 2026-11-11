@@ -467,6 +467,44 @@ transformer time and unified-memory use. Core reuse holds the previous full
 transformer residual while refreshing the patch projection and timestep-aware
 head; it remains mutually exclusive with whole-velocity reuse.
 
+### Second pass
+
+`--second-pass F` re-denoises the tail of the same released grid. The clean
+latent from the first pass is mixed back to the sigma of step
+`round(steps * (1 - F))` with fresh seeded noise
+(`x = (1 - sigma) * x0 + sigma * noise`), then only the remaining Euler steps
+run. `--second-pass-seed N` selects that noise (default: seed + 1). No extra
+VAE work is needed: the pass refines the first pass's latent, and the single
+decode at the end sees the result.
+
+Because the video schedule carries a 12x sigma shift, `F` is a step fraction,
+not a noise level: F=0.1 starts at sigma 0.57, F=0.2 at 0.75 and F=0.5 at
+0.92, which is close to a fresh generation driven by the old latent. Use
+0.1-0.2 to keep framing and motion while re-synthesizing detail, 0.05 for a
+barely visible polish, and larger values only when the pass should re-read the
+shot. Audio follows the same grid on its own 3x shift. Condition rows (first
+and last frame, references) stay resident across the pass, so FL2VA and
+Ref2VA conditioning still applies, and `--layers`, `--reuse` and
+`--core-reuse` apply unchanged to both passes.
+
+`--second-pass-canvas WxH` turns the second pass into a hires fix. The first
+pass still runs on the internal render canvas; its latent is bilinearly
+up-sampled onto the new canvas and re-noised to the same grid point, then a
+complete second pipeline runs there: the prompt, the first and last frames and
+every reference are re-encoded at that canvas, a fresh transformer is loaded,
+and only the tail steps are evaluated before decoding. The bridge stays in
+latent space because the video encoder's continuous 4x temporal grid does not
+match the generator's 5+17n chunked grid, so a decode/re-encode round trip
+cannot reproduce the target latent count. Budget a second setup pass (text
+encoder plus transformer load) for the new canvas; the first-pass transformer
+is released before the bridge so both canvases never reside together. The
+second canvas must be a same-aspect multiple of 32 no larger than the output
+canvas.
+
+Because the bridge is a bilinear latent up-sample, a weak tail keeps the
+structure it duplicates: use `--second-pass 0.4` or more for a canvas pass.
+Same-canvas refinement (no canvas flag) works well at 0.1-0.2.
+
 ### Exact DiT fusions
 
 Every active DiT block fuses its attention residual gate with the following MLP

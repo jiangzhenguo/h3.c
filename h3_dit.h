@@ -118,6 +118,18 @@ int h3_dit_denoise_euler_preview(
                          h3_dit_preview preview, void *preview_opaque,
                          char *error, size_t error_size);
 
+/* Second-pass variant: the caller re-noises its clean latent to
+ * sigmas.video[start_step] / sigmas.audio[start_step] and the sampler runs
+ * only the remaining tail of the same released grid. Everything else matches
+ * h3_dit_denoise_euler_preview; start_step 0 is the normal first pass. */
+int h3_dit_denoise_euler_from(
+                         h3_dit *dit, float *video_latent,
+                         float *audio_latent, int start_step,
+                         int reuse_interval,
+                         h3_dit_progress progress, void *progress_opaque,
+                         h3_dit_preview preview, void *preview_opaque,
+                         char *error, size_t error_size);
+
 /* Build the velocity-evaluation mask used by the serving sampler. Returns the
  * evaluation count, or -1 for invalid arguments. Public internally so the
  * quality-tuned aggressive schedule remains pinned by cheap host tests. */

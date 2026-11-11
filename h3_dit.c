@@ -2611,10 +2611,15 @@ static int ensure_previous_velocities(h3_dit *dit, char *error,
 }
 
 static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
-                             float *audio_latent, int reuse_interval,
+                             float *audio_latent, int start_step,
+                             int reuse_interval,
                              h3_dit_progress progress, void *progress_opaque,
                              h3_dit_preview preview, void *preview_opaque,
                              char *error, size_t error_size) {
+    if (start_step < 0 || start_step >= dit->sigmas.steps) {
+        fail(error, error_size, "invalid Euler start step %d", start_step);
+        return 0;
+    }
     uint8_t selected[H3_MAX_STEPS] = {0};
     int selected_count = h3_dit_reuse_schedule(
         dit->sigmas.steps, reuse_interval, selected, sizeof(selected));
@@ -2627,6 +2632,9 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
         return 0;
     }
     if (custom_count > 0) selected_count = custom_count;
+    /* A second pass starts mid-grid, so its first step must always be
+     * evaluated even when denoiser reuse would otherwise skip it. */
+    if (start_step > 0) selected[start_step] = 1;
     if (reuse_interval > 1 && getenv("H3_PROFILE"))
         fprintf(stderr, "h3: %s GPU reuse schedule has %d evaluations\n",
                 custom_count > 0 ? "custom" : "selected", selected_count);
@@ -2670,7 +2678,7 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
     int previous_evaluated = -1;
     unsigned pending_evaluations = 0;
     int command_active = 0;
-    for (int step = 0; step < dit->sigmas.steps && ok; step++) {
+    for (int step = start_step; step < dit->sigmas.steps && ok; step++) {
         report(progress, progress_opaque, "denoise enqueue", step,
                dit->sigmas.steps);
         if (!command_active) {
@@ -2858,21 +2866,23 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
     return ok;
 }
 
-int h3_dit_denoise_euler_preview(
+int h3_dit_denoise_euler_from(
                          h3_dit *dit, float *video_latent,
-                         float *audio_latent, int reuse_interval,
+                         float *audio_latent, int start_step,
+                         int reuse_interval,
                          h3_dit_progress progress, void *progress_opaque,
                          h3_dit_preview preview, void *preview_opaque,
                          char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!dit || !video_latent || !audio_latent || reuse_interval < 1 ||
-        reuse_interval > 32 ||
+        reuse_interval > 32 || start_step < 0 ||
+        start_step >= dit->sigmas.steps ||
         dit->sigmas.steps != h3_dit_schedule_steps(dit->schedule)) {
         fail(error, error_size, "invalid Euler denoising arguments");
         return 0;
     }
     if (gpu_sampler_requested(dit))
-        return denoise_euler_gpu(dit, video_latent, audio_latent,
+        return denoise_euler_gpu(dit, video_latent, audio_latent, start_step,
                                  reuse_interval, progress, progress_opaque,
                                  preview, preview_opaque,
                                  error, error_size);
@@ -2888,6 +2898,7 @@ int h3_dit_denoise_euler_preview(
         return 0;
     }
     if (custom_count > 0) selected_count = custom_count;
+    if (start_step > 0) selected[start_step] = 1;
     if (reuse_interval > 1 && getenv("H3_PROFILE"))
         fprintf(stderr, "h3: %s reuse schedule has %d evaluations\n",
                 custom_count > 0 ? "custom" : "selected", selected_count);
@@ -2918,7 +2929,7 @@ int h3_dit_denoise_euler_preview(
     int ok = 1;
     int last_evaluated = -1;
     int previous_evaluated = -1;
-    for (int step = 0; step < dit->sigmas.steps && ok; step++) {
+    for (int step = start_step; step < dit->sigmas.steps && ok; step++) {
         report(progress, progress_opaque, "denoise", step, dit->sigmas.steps);
         int evaluate = selected[step];
         if (evaluate) {
@@ -2983,12 +2994,24 @@ int h3_dit_denoise_euler_preview(
     return ok;
 }
 
+int h3_dit_denoise_euler_preview(
+                         h3_dit *dit, float *video_latent,
+                         float *audio_latent, int reuse_interval,
+                         h3_dit_progress progress, void *progress_opaque,
+                         h3_dit_preview preview, void *preview_opaque,
+                         char *error, size_t error_size) {
+    return h3_dit_denoise_euler_from(
+        dit, video_latent, audio_latent, 0, reuse_interval,
+        progress, progress_opaque, preview, preview_opaque,
+        error, error_size);
+}
+
 int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
                          float *audio_latent, int reuse_interval,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
-    return h3_dit_denoise_euler_preview(
-        dit, video_latent, audio_latent, reuse_interval,
+    return h3_dit_denoise_euler_from(
+        dit, video_latent, audio_latent, 0, reuse_interval,
         progress, progress_opaque, NULL, NULL, error, error_size);
 }
 

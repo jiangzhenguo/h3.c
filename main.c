@@ -29,6 +29,9 @@ static void usage(const char *program) {
         "      --seconds N        Requested duration at 24 fps (instead of --frames)\n"
         "      --steps N          Denoising passes (default: 20)\n"
         "      --reuse N          Denoiser reuse: 1 close, 2 fast, 3 aggressive\n"
+        "      --second-pass F    Re-denoise the last F of the sigma grid (0<F<1)\n"
+        "      --second-pass-seed N  Noise seed for the second pass (default: seed+1)\n"
+        "      --second-pass-canvas WxH  Re-run the tail at a new, larger canvas\n"
         "      --layers N         DiT blocks: 50 exact, 45 fast, 40 aggressive\n"
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
@@ -72,6 +75,34 @@ static int parse_int(const char *value, const char *label) {
         exit(2);
     }
     return (int)parsed;
+}
+
+static double parse_double(const char *value, const char *label) {
+    char *end = NULL;
+    errno = 0;
+    double parsed = strtod(value, &end);
+    if (errno || !end || *end || !isfinite(parsed)) {
+        fprintf(stderr, "h3: invalid %s: %s\n", label, value);
+        exit(2);
+    }
+    return parsed;
+}
+
+static void parse_canvas(const char *value, const char *label,
+                         int *width, int *height) {
+    char *end = NULL;
+    errno = 0;
+    long parsed_width = strtol(value, &end, 10);
+    long parsed_height = 0;
+    if (!errno && end && (*end == 'x' || *end == 'X'))
+        parsed_height = strtol(end + 1, &end, 10);
+    if (errno || !end || *end || parsed_width < 0 || parsed_height < 0 ||
+        parsed_width > INT32_MAX || parsed_height > INT32_MAX) {
+        fprintf(stderr, "h3: invalid %s: %s\n", label, value);
+        exit(2);
+    }
+    *width = (int)parsed_width;
+    *height = (int)parsed_height;
 }
 
 static int frames_from_seconds(const char *value) {
@@ -235,6 +266,7 @@ int main(int argc, char **argv) {
 
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
            OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_REUSE,
+           OPT_SECOND_PASS, OPT_SECOND_PASS_SEED, OPT_SECOND_PASS_CANVAS,
            OPT_LAYERS,
            OPT_CORE_REUSE,
            OPT_TOKEN_REDUCTION,
@@ -268,6 +300,10 @@ int main(int argc, char **argv) {
         {"seconds", required_argument, NULL, OPT_SECONDS},
         {"steps", required_argument, NULL, OPT_STEPS},
         {"reuse", required_argument, NULL, OPT_REUSE},
+        {"second-pass", required_argument, NULL, OPT_SECOND_PASS},
+        {"second-pass-seed", required_argument, NULL, OPT_SECOND_PASS_SEED},
+        {"second-pass-canvas", required_argument, NULL,
+         OPT_SECOND_PASS_CANVAS},
         {"layers", required_argument, NULL, OPT_LAYERS},
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
         {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
@@ -351,6 +387,31 @@ int main(int argc, char **argv) {
             case OPT_REUSE:
                 params.denoise_reuse = parse_int(optarg, "reuse");
                 break;
+            case OPT_SECOND_PASS: {
+                double fraction = parse_double(optarg, "second pass");
+                if (!(fraction > 0.0 && fraction < 1.0)) {
+                    fprintf(stderr,
+                            "h3: second pass fraction must be in (0, 1): %s\n",
+                            optarg);
+                    exit(2);
+                }
+                params.second_pass_denoise = fraction;
+                break;
+            }
+            case OPT_SECOND_PASS_CANVAS:
+                parse_canvas(optarg, "second pass canvas",
+                             &params.second_pass_width,
+                             &params.second_pass_height);
+                break;
+            case OPT_SECOND_PASS_SEED: {
+                uint64_t seed = parse_u64(optarg, "second pass seed");
+                if (seed > (uint64_t)INT64_MAX) {
+                    fprintf(stderr, "h3: second pass seed is too large\n");
+                    exit(2);
+                }
+                params.second_pass_seed = (int64_t)seed;
+                break;
+            }
             case OPT_LAYERS:
                 params.dit_layers = parse_int(optarg, "layers");
                 break;
