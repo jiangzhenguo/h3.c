@@ -406,6 +406,95 @@ Standalone audio must accompany an image or video reference. Audio references
 must be 2–15 seconds; at most three audio inputs are accepted and their total
 decoded duration is capped at 15 seconds.
 
+### 9. Generate a still image
+
+MiniMax-H3-Image is a separate open-weight checkpoint that reuses the H3
+transformer without the audio stream, a 2D ViT image VAE, and a fixed six-step
+guidance-distilled schedule with one output head per step. Point `-d` at the
+image repository and `--text-encoder-dir` at the shared Qwen3-VL encoder from
+the video checkpoint:
+
+```sh
+./h3 --image \
+  -d /path/to/MiniMax-H3-Image \
+  --text-encoder-dir /path/to/MiniMax-H3/FL2VA/text_encoder \
+  --image-size 2048x2048 \
+  -p "An overhead photograph of a rustic farm-to-table spread on a weathered wooden table." \
+  -o outputs/still.png
+```
+
+The canvas sides must be multiples of 32 and at most 4096. There is no
+`--steps`, `--reuse`, negative prompt, or guidance scale: the released
+checkpoint is distilled for exactly six denoising passes and a fixed sigma
+grid. `--image-resident` keeps the 62 GiB DiT mapped instead of streaming it from
+SSD. Streaming is the default for stills because it is faster here, not
+because residency is impossible: on the same 512x512 request the transformer
+phase took 25.8 s streamed versus 43.0 s resident, and residency pushed swap
+from 11.7 GiB to 18.8 GiB because the 62 GiB Qwen encoder that runs just
+before it has already claimed the page cache. Both modes produce
+byte-identical files. Video keeps residency as its default because upstream
+ships it that way and a long video run amortises the page-in cost across many
+more steps; `--ssd-streaming` is the video opt-in for the streaming path.
+
+Measured on an M5 Pro with 64 GiB, SSD streaming on, warm file cache:
+
+| Canvas | Wall time | Notes |
+|---|---:|---|
+| 512x512 | 37-39 s | 4 VAE tiles; the six streamed passes dominate |
+| 1024x1024 | 45-49 s | 25 VAE tiles |
+| 2048x2048 | 87 s | 64 tiles, 8.7 MiB PNG |
+| 4096x4096 | 7 min 05 s | native 4K, single DiT pass, 29.2 MiB PNG |
+
+A 4096x4096 request is genuinely native: the transformer runs one full-attention
+pass over the 16384 patch rows of the 4K latent grid rather than generating
+smaller and enlarging. Only the VAE decoder tiles, which is the released recipe.
+That run took 6 s of Qwen encoding, 409 s of DiT (49 s of it streaming) and 10 s
+of VAE decoding, peaking at 4.5 GiB of unified memory. The 2048x2048 figure
+breaks down as 6 s of Qwen encoding, 76 s of DiT (22 s
+of which is streaming 216 GiB of weights) and 4 s of VAE decoding. The
+denoising passes are stream-bound at small canvases and compute-bound at
+large ones, which is why 512x512 and 1024x1024 land within 10 s of each other.
+
+The 62 GiB transformer, the Qwen3-VL encoder, and the image VAE are loaded in
+phases, so peak residency stays far below the sum of the three. `--image-layers
+N` loads only the first `N` transformer blocks. It is a plumbing diagnostic for
+a partially downloaded checkpoint, not a quality setting: the released model
+needs all 50 blocks.
+
+An edit is the same command plus one `--ref-image` per reference; the prompt
+addresses them as `<Picture 1>`, `<Picture 2>`, ... in that order:
+
+```sh
+./h3 --image -d /path/to/MiniMax-H3-Image \
+  --text-encoder-dir /path/to/MiniMax-H3/FL2VA/text_encoder \
+  --image-size 1536x1536 \
+  --ref-image reference.png \
+  -p "Keep everything in <Picture 1> as it is, but remove the headphones..." \
+  -o outputs/edit.png
+```
+
+Up to 16 references are accepted. Each is encoded twice: once through the
+image VAE (short edge kept inside 1024-2048) and once through the Qwen3-VL
+vision tower (short edge pinned to 1024), so the transformer both sees the
+reference as packed latent rows and reads its caption through the text
+encoder. The image VAE needs its `vae/config.json` (it holds `latents_mean` and
+`latents_std`); a checkpoint copied without it fails at the reference-encoding
+step. The VAE encoder is loaded once per run and reused for every
+reference; `h3_video_vae_encode()` keeps its one-shot behaviour for the video
+paths, and a three-reference edit produces byte-identical output either way. Reference rows ride through the six steps frozen at t = 0.999 and
+only the generated rows are updated. Measured on an M5 Pro: a 1536x1536
+single-reference edit takes about 2 minutes, a two-reference 1536x1024 edit
+about 6 minutes, and a three-reference 1024x1024 edit about 8 minutes: every
+reference contributes its own packed rows to the full-attention sequence, so
+cost grows with the reference count rather than staying flat.
+
+`--image-layers N` is also the fastest way to smoke-test a fresh build before
+the whole 64 GiB checkpoint is on disk: with only the first shard present,
+`--image-layers 1 --image-size 256x256` runs the complete pipeline (tokenizer,
+Qwen encoder, six PDD steps, VAE decode, PNG write) in about seven seconds and
+produces a structured-noise image, which proves the plumbing without saying
+anything about model quality.
+
 ## Tests and runtime requirements
 
 ```sh
@@ -582,6 +671,94 @@ The video VAE automatically chooses a 256-320 pixel spatial tile from the
 requested canvas geometry, minimizing repeated overlap work while keeping peak
 storage bounded. `H3_VAE_TILE_PIXELS=256` restores the original conservative
 tile plan for close-reference diagnosis.
+
+### Image VAE decoder keeps its weights resident
+
+The 2D image decoder used to reload all 24 transformer blocks, plus the input
+and output projections, for every tile. A 2048x2048 decode is 64 tiles, so it
+re-read roughly 100 GiB of weights to produce one image. `h3_image_vae.c` now
+loads the decoder once per decode: the activation buffers are still rebuilt per
+tile, but the weights stay resident.
+
+| 2048x2048 VAE decode | Before | After |
+|---|---:|---:|
+| Wall time | 39.5 s | 3.6 s |
+| Cumulative allocation | 92.5 GiB | 2.2 GiB |
+
+Peak residency rises by about 1.6 GiB because all 24 blocks stay mapped. Both
+builds produce byte-identical PNGs.
+
+### Known deviations from the released recipe
+
+Two behaviours of the reference pipeline are deliberately not implemented yet,
+both inside the image path only:
+
+- **No minimum-generation-area upscaling.** The Diffusers pipeline raises a
+  request smaller than 4 MP (4194304 pixels) onto a larger canvas of the same
+  aspect ratio and downsamples the result, so a 1024x1024 request costs as much
+  as a 2048x2048 one. This build generates at exactly the requested canvas, which
+  is why 1024x1024 takes 45-49 s instead of 87 s. Small canvases therefore may
+  differ in quality from the reference implementation.
+- **Reference latents use the posterior mode.** The released recipe draws one
+  posterior sample per reference and rounds it to float16 before normalizing.
+  `h3_video_vae_encode()` returns the posterior mean, which is deterministic and
+  matches the conditioning path this project already validates for video, but it
+  is not the same draw. Editing results are stable and reproducible for a given
+  seed rather than seed-varying in that component.
+
+### Streaming versus residency
+
+MiniMax-H3-Image defaults to SSD streaming while MiniMax-H3 video defaults to
+residency. Both use the same zero-copy loader, so this is a policy choice, and
+the two costs trade against each other:
+
+- Residency maps the whole 62 GiB transformer with `mmap` and lets the system
+  page it in once. Cost: one 62 GiB read, plus whatever memory pressure forces
+  back out again.
+- Streaming reads only the four matrices of each block, 35.8 GiB, but it does so
+  on every denoising step.
+
+Residency therefore wins on bytes (`62` against `35.8 x steps`) and streaming
+wins on throughput (about 15 GiB/s with four parallel readers against roughly
+3.6 GiB/s from page faults). Measured on the same M5 Pro:
+
+| Workload | Resident | Streamed |
+|---|---:|---:|
+| 512x512 still, 6 steps | 43.0 s | 25.8 s |
+| 512x512, 22-frame video, turbo checkpoint, 6 steps | 31.4 s | 38.7 s |
+
+The still loses with residency because the 62 GiB Qwen encoder runs just before
+it and has already spent the page cache, so the transformer starts cold and then
+fights swap (11.7 to 18.8 GiB). The video keeps residency because the same
+62 GiB is paged in once and reused across its steps. Note that the video
+streaming path still fetches a block's four matrices one at a time; porting the
+parallel readers below to `h3_dit.c` would roughly halve its streamed time and
+flip that row.
+
+### Parallel streamed layer reads
+
+SSD streaming fetches a transformer block as four independent matrices
+(`qkv`, `out`, `fc1`, `fc2`). They used to be read one after another into a
+single Metal buffer on one thread, which left the SSD at roughly half of its
+queue depth. `h3_image_dit.c` now issues those four reads concurrently, one
+thread each, and the calling thread always takes the first matrix so the
+prefetch thread never sits idle.
+
+Measured on an M5 Pro with the page cache in the same state for both runs
+(512x512 text-to-image, `H3_PROFILE=1`, 216 GiB streamed per image):
+
+| Readers | Stream time | Throughput |
+|---|---:|---:|
+| 1 (sequential) | 21.0-21.3 s | 10.2 GiB/s |
+| 4 (one per matrix) | 14.1-14.3 s | 15.1-15.3 GiB/s |
+
+The generated files are byte-identical between the two settings, so this is a
+pure scheduling change. `H3_STREAM_READ_THREADS=N` caps the number of
+concurrent readers (`1` restores the old sequential path) for A/B work.
+
+`H3_STREAM_UNCACHED=0` instead stops bypassing the page cache. It made the same
+workload slower (30.5 s versus 25.8 s for the whole transformer phase) because
+62 GiB of weights evict everything else, so bypassing stays the default.
 
 ### Weight residency and streamed prompt encoding
 

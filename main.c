@@ -1,6 +1,8 @@
 #include "h3.h"
 #include "h3_cli.h"
 #include "h3_host.h"
+#include "h3_image.h"
+#include "h3_png.h"
 #include "h3_terminal.h"
 
 #include <errno.h>
@@ -21,6 +23,11 @@ static void usage(const char *program) {
         "  -d, --model-dir PATH   MiniMax-H3 local directory\n"
         "  -p, --prompt TEXT      Raw H3 prompt\n"
         "  -o, --output PATH      Output MP4 (default: outputs/h3.mp4)\n"
+        "      --image            Generate a still with MiniMax-H3-Image\n"
+        "      --image-size WxH   Image canvas (default: 2048x2048, 32-aligned)\n"
+        "      --image-resident   Keep the image DiT resident instead of SSD streaming\n"
+        "      --image-layers N   Diagnostic: load only the first N image blocks\n"
+        "      --text-encoder-dir PATH  Shared Qwen3-VL encoder for --image\n"
         "      --width N          Output width (default: 864)\n"
         "      --height N         Output height (default: 480)\n"
         "      --render-width N   Lower internal model width (optional)\n"
@@ -202,6 +209,26 @@ static int cli_progress(const char *phase, int completed, int total,
     return 0;
 }
 
+typedef struct {
+    char phase[64];
+    int active;
+} image_cli_state;
+
+static int image_cli_progress(const char *phase, int completed, int total,
+                              void *opaque) {
+    image_cli_state *state = opaque;
+    if (!state || !phase || total <= 0) return 0;
+    if (strcmp(state->phase, phase)) {
+        if (state->active) fputc('\n', stderr);
+        snprintf(state->phase, sizeof(state->phase), "%s", phase);
+    }
+    state->active = completed < total;
+    fprintf(stderr, "\r%-25s %4d/%-4d", phase, completed, total);
+    if (!state->active) fputc('\n', stderr);
+    fflush(stderr);
+    return 0;
+}
+
 static int cli_frame(const h3_frame *frame, void *opaque) {
     cli_state *state = opaque;
     int preview = frame->denoise_step >= 0;
@@ -287,7 +314,9 @@ int main(int argc, char **argv) {
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
-           OPT_PROFILE, OPT_INFO };
+           OPT_PROFILE, OPT_INFO,
+           OPT_IMAGE, OPT_IMAGE_SIZE, OPT_IMAGE_RESIDENT,
+           OPT_IMAGE_LAYERS, OPT_TEXT_ENCODER_DIR };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -344,12 +373,18 @@ int main(int argc, char **argv) {
         {"zoom", required_argument, NULL, OPT_ZOOM},
         {"profile", no_argument, NULL, OPT_PROFILE},
         {"info", no_argument, NULL, OPT_INFO},
+        {"image", no_argument, NULL, OPT_IMAGE},
+        {"image-size", required_argument, NULL, OPT_IMAGE_SIZE},
+        {"image-resident", no_argument, NULL, OPT_IMAGE_RESIDENT},
+        {"image-layers", required_argument, NULL, OPT_IMAGE_LAYERS},
+        {"text-encoder-dir", required_argument, NULL, OPT_TEXT_ENCODER_DIR},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
     const char *model_dir = NULL;
     const char *prompt = NULL;
     const char *output = "outputs/h3.mp4";
+    int output_given = 0;
     h3_params params = H3_PARAMS_DEFAULT;
     h3_reference references[12];
     size_t reference_count = 0;
@@ -357,6 +392,11 @@ int main(int argc, char **argv) {
     int show = 0;
     int profile = 0;
     int info = 0;
+    int image_mode = 0;
+    int image_resident = 0;
+    int image_layers = 50;
+    int image_width = 2048, image_height = 2048;
+    const char *text_encoder_dir = NULL;
     int frames_given = 0;
     int seconds_given = 0;
     int seed_given = 0;
@@ -365,7 +405,7 @@ int main(int argc, char **argv) {
         switch (option) {
             case 'd': model_dir = optarg; break;
             case 'p': prompt = optarg; break;
-            case 'o': output = optarg; break;
+            case 'o': output = optarg; output_given = 1; break;
             case 'h': usage(argv[0]); return 0;
             case OPT_WIDTH: params.width = parse_int(optarg, "width"); break;
             case OPT_HEIGHT: params.height = parse_int(optarg, "height"); break;
@@ -526,6 +566,15 @@ int main(int argc, char **argv) {
                 break;
             case OPT_PROFILE: profile = 1; break;
             case OPT_INFO: info = 1; break;
+            case OPT_IMAGE: image_mode = 1; break;
+            case OPT_IMAGE_SIZE:
+                parse_canvas(optarg, "image size", &image_width, &image_height);
+                break;
+            case OPT_IMAGE_RESIDENT: image_resident = 1; break;
+            case OPT_IMAGE_LAYERS:
+                image_layers = parse_int(optarg, "image layers");
+                break;
+            case OPT_TEXT_ENCODER_DIR: text_encoder_dir = optarg; break;
             default: usage(argv[0]); return 2;
         }
     }
@@ -552,6 +601,61 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (profile) setenv("H3_PROFILE", "1", 1);
+    if (image_mode) {
+        if (!prompt || !*prompt) {
+            fprintf(stderr, "h3: --image requires -p PROMPT\n");
+            return 2;
+        }
+        if (!output_given) output = "outputs/h3.png";
+        h3_image_params image = H3_IMAGE_PARAMS_DEFAULT;
+        image.width = image_width;
+        image.height = image_height;
+        image.seed = params.seed;
+        image.ssd_streaming = image_resident ? 0 : 1;
+        image.layers = image_layers;
+        image.text_encoder_directory = text_encoder_dir;
+        const char *reference_paths[16];
+        size_t image_references = 0;
+        for (size_t index = 0; index < reference_count; index++) {
+            if (references[index].kind != H3_REFERENCE_IMAGE) {
+                fprintf(stderr,
+                        "h3: --image accepts image references only; "
+                        "drop the video or audio reference\n");
+                return 2;
+            }
+            if (image_references >= 16) {
+                fprintf(stderr, "h3: --image accepts at most 16 references\n");
+                return 2;
+            }
+            reference_paths[image_references++] = references[index].path;
+        }
+        image.reference_images = reference_paths;
+        image.reference_count = image_references;
+        image.on_progress = image_cli_progress;
+        image_cli_state image_cli;
+        memset(&image_cli, 0, sizeof(image_cli));
+        image.callback_opaque = &image_cli;
+        h3_image_vae_output still;
+        memset(&still, 0, sizeof(still));
+        char error[512];
+        if (!h3_image_generate(model_dir, "h3_shaders.metal", prompt, &image,
+                               &still, error, sizeof(error))) {
+            if (image_cli.active) fputc('\n', stderr);
+            fprintf(stderr, "h3: %s\n", error);
+            return 1;
+        }
+        int wrote = h3_png_write_rgb8(output, still.rgb, still.width,
+                                      still.height, error, sizeof(error));
+        fprintf(stderr, "h3: %dx%d image, seed %" PRIu64 "\n", still.width,
+                still.height, image.seed);
+        h3_image_vae_output_free(&still);
+        if (!wrote) {
+            fprintf(stderr, "h3: %s\n", error);
+            return 1;
+        }
+        fprintf(stderr, "h3: wrote %s\n", output);
+        return 0;
+    }
     h3_ctx *ctx = h3_load_dir(model_dir);
     if (!ctx) {
         fprintf(stderr, "h3: %s\n", h3_last_error(NULL));

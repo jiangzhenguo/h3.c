@@ -234,53 +234,66 @@ static int parse_float_array(const char *json, const char *key, float *values,
     return 1;
 }
 
-static int load_normalization(encoder_context *encoder,
-                              const char *weight_directory,
-                              char *error, size_t error_size) {
-    size_t path_size = strlen(weight_directory) + strlen("/../config.json") + 1;
-    char *path = malloc(path_size);
-    if (!path) {
-        fail(error, error_size, "out of memory resolving video VAE config");
-        return 0;
-    }
-    snprintf(path, path_size, "%s/../config.json", weight_directory);
+/* Read latents_mean / latents_std from the nearest config. The video VAE keeps
+ * them one level above the weight directory, while MiniMax-H3-Image keeps them
+ * beside the weights, so both locations are probed in order. */
+static int load_normalization_file(const char *path, encoder_context *encoder,
+                                   char *error, size_t error_size) {
     FILE *file = fopen(path, "rb");
     if (!file || fseek(file, 0, SEEK_END)) {
-        fail(error, error_size, "cannot open video VAE config %s: %s", path,
-             strerror(errno));
         if (file) fclose(file);
-        free(path);
         return 0;
     }
     long end = ftell(file);
     if (end < 1 || end > 1024 * 1024 || fseek(file, 0, SEEK_SET)) {
-        fail(error, error_size, "invalid video VAE config %s", path);
         fclose(file);
-        free(path);
         return 0;
     }
     char *json = malloc((size_t)end + 1);
     if (!json || fread(json, 1, (size_t)end, file) != (size_t)end) {
-        fail(error, error_size, "cannot read video VAE config %s", path);
         free(json);
         fclose(file);
-        free(path);
         return 0;
     }
     json[end] = '\0';
     fclose(file);
-    free(path);
+    char detail[256];
     int ok = parse_float_array(json, "latents_mean", encoder->latent_mean,
-                               LATENT_CHANNELS, error, error_size) &&
+                               LATENT_CHANNELS, detail, sizeof(detail)) &&
              parse_float_array(json, "latents_std", encoder->latent_std,
-                               LATENT_CHANNELS, error, error_size);
+                               LATENT_CHANNELS, detail, sizeof(detail));
     free(json);
-    if (ok) for (int channel = 0; channel < LATENT_CHANNELS; channel++)
+    if (!ok) return 0;
+    for (int channel = 0; channel < LATENT_CHANNELS; channel++)
         if (encoder->latent_std[channel] <= 0.0f) {
             fail(error, error_size, "video VAE latent deviation is invalid");
+            return -1;
+        }
+    return 1;
+}
+
+static int load_normalization(encoder_context *encoder,
+                              const char *weight_directory,
+                              char *error, size_t error_size) {
+    static const char *suffixes[] = {"/config.json", "/../config.json"};
+    for (size_t which = 0; which < sizeof(suffixes) / sizeof(*suffixes);
+         which++) {
+        size_t path_size = strlen(weight_directory) + strlen(suffixes[which]) + 1;
+        char *path = malloc(path_size);
+        if (!path) {
+            fail(error, error_size, "out of memory resolving video VAE config");
             return 0;
         }
-    return ok;
+        snprintf(path, path_size, "%s%s", weight_directory, suffixes[which]);
+        int loaded = load_normalization_file(path, encoder, error, error_size);
+        free(path);
+        if (loaded > 0) return 1;
+        if (loaded < 0) return 0;
+    }
+    fail(error, error_size,
+         "cannot read latents_mean/latents_std from %s/config.json or %s/../config.json",
+         weight_directory, weight_directory);
+    return 0;
 }
 
 static int load_weights(encoder_context *encoder, char *error,
@@ -742,17 +755,68 @@ static int stitch_latents(float **tiles, int latent_time,
     return 1;
 }
 
-int h3_video_vae_encode(const char *weight_directory,
+struct h3_video_vae_encoder {
+    encoder_context *context;
+};
+
+h3_video_vae_encoder *h3_video_vae_encoder_load(
+                        const char *weight_directory,
                         const char *shader_source_path,
+                        char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!weight_directory || !*weight_directory || !shader_source_path ||
+        !*shader_source_path) {
+        fail(error, error_size, "invalid visual encoder arguments");
+        return NULL;
+    }
+    encoder_context *context = calloc(1, sizeof(*context));
+    if (!context) {
+        fail(error, error_size, "out of memory creating visual encoder");
+        return NULL;
+    }
+    context->gpu = h3_gpu_create(shader_source_path, error, error_size);
+    if (context->gpu)
+        h3_gpu_profile_set_label(context->gpu, "video VAE encoder");
+    if (context->gpu)
+        context->store = h3_weight_store_open(weight_directory, error,
+                                              error_size);
+    if (!context->gpu || !context->store ||
+        !load_normalization(context, weight_directory, error, error_size) ||
+        !load_weights(context, error, error_size)) {
+        cleanup(context);
+        free(context);
+        return NULL;
+    }
+    h3_video_vae_encoder *encoder = calloc(1, sizeof(*encoder));
+    if (!encoder) {
+        cleanup(context);
+        free(context);
+        fail(error, error_size, "out of memory creating visual encoder");
+        return NULL;
+    }
+    encoder->context = context;
+    return encoder;
+}
+
+void h3_video_vae_encoder_free(h3_video_vae_encoder *encoder) {
+    if (!encoder) return;
+    if (encoder->context) {
+        cleanup(encoder->context);
+        free(encoder->context);
+    }
+    free(encoder);
+}
+
+int h3_video_vae_encoder_encode(h3_video_vae_encoder *encoder,
                         const float *pixels, int frames, int height, int width,
                         h3_video_encoder_progress progress, void *progress_opaque,
                         h3_video_latent *output,
                         char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (output) memset(output, 0, sizeof(*output));
-    if (!weight_directory || !*weight_directory || !shader_source_path ||
-        !*shader_source_path || !pixels || !output || frames < 1 || height < 32 ||
-        width < 32 || height % SPATIAL_RATIO || width % SPATIAL_RATIO) {
+    if (!encoder || !encoder->context || !pixels || !output || frames < 1 ||
+        height < 32 || width < 32 || height % SPATIAL_RATIO ||
+        width % SPATIAL_RATIO) {
         fail(error, error_size, "invalid visual encoder arguments");
         return 0;
     }
@@ -764,15 +828,7 @@ int h3_video_vae_encode(const char *weight_directory,
         tile_axis_free(&x_axis);
         return 0;
     }
-    encoder_context encoder = {0};
-    encoder.gpu = h3_gpu_create(shader_source_path, error, error_size);
-    if (encoder.gpu)
-        h3_gpu_profile_set_label(encoder.gpu, "video VAE encoder");
-    if (encoder.gpu)
-        encoder.store = h3_weight_store_open(weight_directory, error, error_size);
-    ok = encoder.gpu && encoder.store &&
-         load_normalization(&encoder, weight_directory, error, error_size) &&
-         load_weights(&encoder, error, error_size);
+    encoder_context *context = encoder->context;
     int tile_count = y_axis.count * x_axis.count;
     float **tiles = ok ? calloc((size_t)tile_count, sizeof(*tiles)) : NULL;
     if (ok && !tiles) {
@@ -787,7 +843,7 @@ int h3_video_vae_encode(const char *weight_directory,
                 y_axis.length, x_axis.length, error, error_size);
             int current_time = 0;
             if (tile) tiles[completed] = encode_tile(
-                &encoder, tile, frames, y_axis.length, x_axis.length,
+                context, tile, frames, y_axis.length, x_axis.length,
                 &current_time, error, error_size);
             free(tile);
             ok = tiles[completed] != NULL &&
@@ -797,13 +853,30 @@ int h3_video_vae_encode(const char *weight_directory,
         }
     if (ok) ok = stitch_latents(tiles, latent_time, &y_axis, &x_axis,
                                 output, error, error_size) &&
-                 h3_gpu_get_stats(encoder.gpu, &output->gpu_stats);
+                 h3_gpu_get_stats(context->gpu, &output->gpu_stats);
     if (tiles) for (int index = 0; index < tile_count; index++) free(tiles[index]);
     free(tiles);
-    cleanup(&encoder);
     tile_axis_free(&y_axis);
     tile_axis_free(&x_axis);
     if (!ok) h3_video_latent_free(output);
+    return ok;
+}
+
+int h3_video_vae_encode(const char *weight_directory,
+                        const char *shader_source_path,
+                        const float *pixels, int frames, int height, int width,
+                        h3_video_encoder_progress progress, void *progress_opaque,
+                        h3_video_latent *output,
+                        char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (output) memset(output, 0, sizeof(*output));
+    h3_video_vae_encoder *encoder = h3_video_vae_encoder_load(
+        weight_directory, shader_source_path, error, error_size);
+    if (!encoder) return 0;
+    int ok = h3_video_vae_encoder_encode(encoder, pixels, frames, height,
+                                         width, progress, progress_opaque,
+                                         output, error, error_size);
+    h3_video_vae_encoder_free(encoder);
     return ok;
 }
 

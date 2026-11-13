@@ -28,6 +28,17 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     int audio_condition,
     h3_dit_schedule_progress progress, void *progress_opaque,
     char *error, size_t error_size);
+
+/* Same precomputation restricted to the first `blocks` transformer blocks.
+ * Blocks at or beyond that index keep a NULL modulation table, which lets a
+ * partially downloaded checkpoint drive a plumbing check. Pass
+ * H3_DIT_BLOCKS for the released model. */
+h3_dit_schedule *h3_dit_schedule_precompute_blocks(
+    const h3_weight_store *weights, h3_gpu *gpu,
+    const h3_sigma_schedule *sigmas, int visual_condition,
+    int audio_condition, unsigned blocks,
+    h3_dit_schedule_progress progress, void *progress_opaque,
+    char *error, size_t error_size);
 void h3_dit_schedule_free(h3_dit_schedule *schedule);
 
 int h3_dit_schedule_steps(const h3_dit_schedule *schedule);

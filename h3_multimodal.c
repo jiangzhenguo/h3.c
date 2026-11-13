@@ -194,6 +194,54 @@ static int encode_presentation(const char *weight_directory,
     return ok;
 }
 
+/* Build a `[Picture 1 label + vision block, Picture 2, ...] + prompt`
+ * presentation. The video FL2VA anchor labels keep the angle brackets the
+ * video prompt refers to (`<Picture n>: `), while MiniMax-H3-Image's edit
+ * labels drop them (`Picture n: `) even though its prompts still say
+ * `<Picture n>`. Everything else, including the mRoPE layout and the per-row
+ * modality tags, is shared. */
+static int encode_picture_presentation(
+                        const h3_tokenizer *tokenizer,
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        const char *prompt,
+                        const h3_vision_output *images, size_t image_count,
+                        int bracketed_labels,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        char *error, size_t error_size) {
+    h3_ids ids = {0};
+    h3_text_vision_span *spans = calloc(image_count, sizeof(*spans));
+    const h3_vision_output **visions = calloc(image_count, sizeof(*visions));
+    int ok = 0;
+    if (!spans || !visions) goto oom;
+    for (size_t image = 0; image < image_count; image++) {
+        const h3_vision_output *vision = &images[image];
+        char prefix[64];
+        int length = bracketed_labels ?
+            snprintf(prefix, sizeof(prefix), "<Picture %zu>: ", image + 1) :
+            snprintf(prefix, sizeof(prefix), "Picture %zu: ", image + 1);
+        visions[image] = vision;
+        if (length < 0 || (size_t)length >= sizeof(prefix) ||
+            !tokenize_append(tokenizer, prefix, &ids, error, error_size) ||
+            !append_vision(&ids, &spans[image], vision, H3_IMAGE_PAD,
+                           error, error_size)) goto cleanup;
+    }
+    if (!tokenize_append(tokenizer, prompt, &ids, error, error_size)) goto cleanup;
+    ok = encode_presentation(weight_directory, shader_source_path,
+        &ids, spans, visions, image_count, progress, progress_opaque,
+        output, error, error_size);
+    goto cleanup;
+
+oom:
+    fail(error, error_size, "out of memory constructing picture presentation");
+cleanup:
+    free(ids.values);
+    free(spans);
+    free(visions);
+    return ok;
+}
+
 int h3_multimodal_encode_fl2va_bf16(
                         const h3_tokenizer *tokenizer,
                         const char *weight_directory,
@@ -210,34 +258,30 @@ int h3_multimodal_encode_fl2va_bf16(
         fail(error, error_size, "invalid FL2VA multimodal presentation arguments");
         return 0;
     }
-    h3_ids ids = {0};
-    h3_text_vision_span *spans = calloc(image_count, sizeof(*spans));
-    const h3_vision_output **visions = calloc(image_count, sizeof(*visions));
-    int ok = 0;
-    if (!spans || !visions) goto oom;
-    for (size_t image = 0; image < image_count; image++) {
-        const h3_vision_output *vision = &images[image];
-        char prefix[64];
-        int length = snprintf(prefix, sizeof(prefix), "<Picture %zu>: ", image + 1);
-        visions[image] = vision;
-        if (length < 0 || (size_t)length >= sizeof(prefix) ||
-            !tokenize_append(tokenizer, prefix, &ids, error, error_size) ||
-            !append_vision(&ids, &spans[image], vision, H3_IMAGE_PAD,
-                           error, error_size)) goto cleanup;
-    }
-    if (!tokenize_append(tokenizer, prompt, &ids, error, error_size)) goto cleanup;
-    ok = encode_presentation(weight_directory, shader_source_path,
-        &ids, spans, visions, image_count, progress, progress_opaque,
-        output, error, error_size);
-    goto cleanup;
+    return encode_picture_presentation(tokenizer, weight_directory,
+        shader_source_path, prompt, images, image_count, 1, progress,
+        progress_opaque, output, error, error_size);
+}
 
-oom:
-    fail(error, error_size, "out of memory constructing FL2VA presentation");
-cleanup:
-    free(ids.values);
-    free(spans);
-    free(visions);
-    return ok;
+int h3_multimodal_encode_image_edit_bf16(
+                        const h3_tokenizer *tokenizer,
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        const char *prompt,
+                        const h3_vision_output *images, size_t image_count,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (output) memset(output, 0, sizeof(*output));
+    if (!tokenizer || !weight_directory || !shader_source_path || !prompt ||
+        !*prompt || !images || !image_count || !output) {
+        fail(error, error_size, "invalid image-edit presentation arguments");
+        return 0;
+    }
+    return encode_picture_presentation(tokenizer, weight_directory,
+        shader_source_path, prompt, images, image_count, 0, progress,
+        progress_opaque, output, error, error_size);
 }
 
 int h3_multimodal_encode_ref2va_bf16(

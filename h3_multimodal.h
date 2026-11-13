@@ -38,6 +38,20 @@ typedef struct {
     const double *timestamps;
 } h3_reference_presentation;
 
+/* Construct the image-edit presentation of MiniMax-H3-Image: a bracketless
+ * `Picture n: ` label plus the vision block of every reference, in request
+ * order, then the prompt verbatim. The prompt refers to them as `<Picture n>`;
+ * the labels themselves carry no angle brackets. */
+int h3_multimodal_encode_image_edit_bf16(
+                        const h3_tokenizer *tokenizer,
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        const char *prompt,
+                        const h3_vision_output *images, size_t image_count,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        char *error, size_t error_size);
+
 /* Construct Ref2VA labels in exact request order, including pending audio
  * labels and per-block video timestamps, then run the Qwen decoder. */
 int h3_multimodal_encode_ref2va_bf16(

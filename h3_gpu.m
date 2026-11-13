@@ -766,10 +766,18 @@ static int h3_gpu_tensor_read_file_bf16_mode(
                      strerror(errno));
         return 0;
     }
+    /* The streaming path bypasses the page cache by default so a 62 GiB weight
+     * set cannot evict everything else. H3_STREAM_UNCACHED=0 keeps the pages,
+     * which lets repeated denoising passes hit RAM instead of the SSD when the
+     * machine has room for them. */
+    const char *cache_policy = getenv("H3_STREAM_UNCACHED");
+    int bypass = uncached;
+    if (cache_policy && *cache_policy && strcmp(cache_policy, "0") == 0)
+        bypass = 0;
 #ifdef F_NOCACHE
-    if (uncached) (void)fcntl(descriptor, F_NOCACHE, 1);
+    if (bypass) (void)fcntl(descriptor, F_NOCACHE, 1);
 #else
-    (void)uncached;
+    (void)bypass;
 #endif
     unsigned char *destination = TENSOR(opaque).buffer.contents;
     size_t completed = 0;

@@ -13,9 +13,12 @@ LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
+
+LIB_C += h3_image_dit.c h3_image_vae.c h3_image.c h3_png.c
 LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
+LDLIBS += -lz
 
 .PHONY: all test parity real-parity clean
 
@@ -108,6 +111,15 @@ h3_vae_bench: tools/vae_bench.o $(LIB_OBJ)
 h3_gpu_bf16_ops_tests: tests/test_gpu_bf16_ops.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_image_dit_tests: tests/test_image_dit.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_image_vae_tests: tests/test_image_vae.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_png_tests: tests/test_png.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -116,10 +128,14 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
 	h3_real_multimodal_text_test h3_real_ref_video_text_test \
-	h3_video_vae_tests h3_gpu_bf16_ops_tests
+	h3_video_vae_tests h3_gpu_bf16_ops_tests \
+	h3_image_dit_tests h3_image_vae_tests h3_png_tests
 
 	./h3_tests
 	./h3_gpu_bf16_ops_tests
+	./h3_image_dit_tests
+	./h3_image_vae_tests
+	./h3_png_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
 	         test -f misc/fixtures/h3_dit_bf16.safetensors; then \
 		./h3_metal_tests misc/fixtures/h3_dit.safetensors && \
@@ -234,4 +250,5 @@ clean:
 		h3_real_video_vae_test h3_semantic_vae_test h3_video_vae_tests \
 		h3_gpu_bf16_ops_tests \
 	h3_dit_bench h3_dit_bench_864 \
+	h3_image_dit_tests h3_image_vae_tests h3_png_tests \
 	libh3.a *.o *.d tests/*.o tests/*.d
